@@ -10,7 +10,7 @@ import sys
 
 from dotenv import load_dotenv
 
-from dan.llm import rank, summarize
+from dan.llm import rank, summarize, write as write_stage
 from dan.paths import ROOT
 from dan.sources import guardian
 
@@ -18,7 +18,7 @@ from dan.sources import guardian
 # (which arrive as real env vars) always win.
 load_dotenv(ROOT / ".env", override=False)
 
-STAGES = ("fetch", "rank", "summarize")
+STAGES = ("fetch", "rank", "summarize", "write")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -52,10 +52,13 @@ def main(argv: list[str] | None = None) -> int:
         rank.rank()
     elif args.only == "summarize":
         summarize.summarize()
+    elif args.only == "write":
+        write_stage.write()
     else:
         guardian.fetch(days_back=args.days_back)
         rank.rank()
         summarize.summarize()
+        write_stage.write()
     return 0
 
 

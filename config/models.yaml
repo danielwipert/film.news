@@ -10,8 +10,8 @@
 
 rank:            google/gemini-2.5-flash-lite
 summarize:       google/gemini-2.5-flash-lite
-write_draft:     anthropic/claude-sonnet-4
-write_critique:  anthropic/claude-sonnet-4
+write_draft:     anthropic/claude-haiku-4.5
+write_critique:  anthropic/claude-haiku-4.5
 sanity_extract:  google/gemini-2.5-flash-lite
 sanity_verify:   google/gemini-2.5-flash-lite
 describe:        google/gemini-2.5-flash-lite
