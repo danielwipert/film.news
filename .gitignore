@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+logs/*
+!logs/.gitkeep
+.DS_Store
+
+# Claude Code local settings
+.claude/
+
+# Test caches
+.pytest_cache/
+
+# Local docx-extraction artifacts (locked dir on Windows; cleanup pending)
+planning/spec_extracted/

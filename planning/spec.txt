@@ -1,0 +1,612 @@
+DAN V2 Spec
+Daily Audio News — Film Edition. Build-ready specification.
+This is the buildable specification for DAN V2: a self-hosted, daily AI-generated podcast covering film news in an old-school AM-radio voice. It is the successor to DAN V1 Spec and supersedes it. Where V1 sketched the architecture, V2 specifies it concretely enough to implement, including I/O contracts, model choices, prompts, file shapes, and failure handling for every stage.
+Status: Ready to implement.
+Reading order: Sections 1 through 3 give the why and the architecture. Sections 4 through 12 are the per-stage specs you&apos;ll build from. Sections 13 through 18 cover orchestration, secrets, repo layout, phasing, and failure handling.
+1. Product Summary
+1.1 What DAN is
+DAN — Daily Audio News — is a private podcast that automatically produces and publishes one new 8 to 12 minute episode per day. Each episode is an AM-radio-style film news brief: the day&apos;s most important movie news, written for the ear, voiced by an Azure neural newscast voice, and delivered through a private RSS feed that the user subscribes to in Apple Podcasts.
+1.2 Why these choices
+DAN is single-listener, single-topic, single-source software. Every architectural decision flows from those three constraints. We don&apos;t deduplicate across sources because there&apos;s only one source. We don&apos;t moderate for a public audience because there&apos;s no public audience. We don&apos;t tune for SEO because the feed is unlisted. This frees us to spend our complexity budget on the parts that actually matter: writing copy that sounds like radio, and producing audio that sounds like a person.
+1.3 Definition of done for V2
+A scheduled GitHub Actions workflow runs daily without human intervention.
+Each run produces one valid MP3 episode between 8 and 12 minutes long.
+The episode is uploaded to Cloudflare R2 at a stable URL.
+The RSS feed is updated and served over HTTPS.
+Apple Podcasts plays new episodes within an hour of publish.
+Total monthly cost is under $5, exclusive of any one-time setup.
+Listening to a week of episodes feels like listening to a real, if eccentric, radio show — not a robot reading articles.
+1.4 What V2 is not
+Not multi-source. We use The Guardian&apos;s film section only. Cross-source aggregation is V3 territory.
+Not fact-checked against external sources. We trust The Guardian as our source of truth and only check that the script doesn&apos;t drift from the source articles.
+Not multi-host. One voice, one show.
+Not public. Feed URL is unlisted. No analytics, no monetization.
+Not real-time. Daily cadence; episodes are scheduled, not breaking-news-driven.
+2. Architecture
+2.1 Pipeline shape
+The system is a linear sequence of nine stages. Each stage reads from a well-defined input file and writes to a well-defined output file. Stages are pure functions of their inputs in the sense that, given the same source articles, the same prompts, and the same model versions, they should produce equivalent (if not byte-identical) outputs. Determinism is not a goal — LLMs and TTS are stochastic — but reproducibility for a given day is.
+Stage 1: FETCH       Guardian API -&gt; 01_raw_articles.json
+Stage 2: RANK        articles     -&gt; 02_ranked.json
+Stage 3: SUMMARIZE   ranked       -&gt; 03_summaries.json
+Stage 4: WRITE       summaries    -&gt; 04_script.txt
+Stage 5: SANITY      script       -&gt; 05_sanity.json [+ rewrite]
+Stage 6: PREP        script       -&gt; 06_ssml.xml + 06_chunks/
+Stage 7: TTS         chunks       -&gt; 07_audio_chunks/*.mp3
+Stage 8: STITCH      audio        -&gt; 08_episode.mp3
+Stage 9: PUBLISH     episode      -&gt; upload + RSS update
+2.2 The folder-on-disk contract
+Every run writes its artifacts to logs/YYYY-MM-DD/ with the numbered filenames shown above. This is not just for debugging — it is the contract between stages. Stage 4 reads 03_summaries.json. Stage 5 reads 04_script.txt. If you need to re-run from a given stage, you delete that file and everything downstream of it, then re-invoke. This makes the pipeline fundamentally debuggable: at any point you can read every intermediate state with a text editor.
+2.3 The provider abstraction principle
+Every external service — LLM, TTS, object storage — is accessed through a thin internal interface, not directly. The Azure TTS client lives behind a TTSProvider class with a synthesize(ssml) method. The OpenRouter LLM client lives behind an LLMProvider class with a complete(prompt, model) method. The R2 uploader lives behind an ObjectStore class with put(key, bytes) and url_for(key) methods.
+This is not premature abstraction. It is a hard requirement, because: we have already committed to swappable TTS, model choice is per-stage and changes often, and debugging is dramatically easier when you can replace a provider with a recorded-fixture stub during local iteration.
+2.4 Idempotency and re-runs
+A given day&apos;s run should be safely re-runnable. If the workflow fails at Stage 6 and you re-run it, the pipeline should pick up from the last completed stage, not redo the LLM calls already paid for. Implementation: each stage checks for the existence of its output file and skips itself if present. A --force flag bypasses this for development. The publish stage (Stage 9) is the one exception — it always runs, but is itself idempotent (overwriting feed.xml and re-uploading the episode is safe).
+3. Decisions Locked In
+These were debated during the V1 to V2 process and are now settled. They are listed here so future-you (and Claude Code) can stop relitigating them.
+3.1 Source
+Single source: The Guardian, film section only. Free Open Platform API, more than sufficient for our volume.
+3.2 LLM strategy
+Provider: OpenRouter, for one-key access to any model.
+Per-stage models: Cheap models for everything except the script writer, which gets the best model we can afford. Specific recommendations in sections 4 through 9.
+Many small calls over one big call: Each stage is its own call, often per-item parallel. Easier to debug, easier to cache, often cheaper.
+Draft + critique on the script writer: Two LLM calls — one to write, one to critique-and-revise. This is the single biggest quality lever in the pipeline.
+3.3 TTS
+Provider: Azure AI Speech (Cognitive Services), behind a TTSProvider abstraction so we can swap.
+Voice: Pending final pick after the smoke test. Working assumption: en-US-AndrewMultilingualNeural with mstts:express-as style=newscast. Backup: en-US-BrianMultilingualNeural.
+Tier: Free F0 (5M chars/month). At ~270K chars/month, we never pay.
+Markup: SSML is required, not optional. The script is generated as SSML, not plain text.
+3.4 Hosting &amp; runtime
+Object storage: Cloudflare R2. S3-compatible API, generous free tier, no egress fees.
+Runtime: GitHub Actions on a daily cron schedule.
+Language: Python 3.11+.
+4. Stage 1 — Fetch (Guardian)
+4.1 Goal
+Pull all film-section articles published in the last 24 hours from The Guardian, with enough metadata and body text for downstream stages to rank, summarize, and verify against.
+4.2 API details
+Endpoint: https://content.guardianapis.com/search
+Auth: api-key query parameter (free developer tier).
+Rate limit: 1 req/sec, 5000/day. We need 1 request per run.
+Required query parameters:
+section          = film
+from-date        = (today minus 1 day, ISO 8601)
+order-by         = newest
+page-size        = 50
+show-fields      = headline,trailText,bodyText,byline,wordcount,publication
+api-key          = $GUARDIAN_API_KEY
+4.3 Output schema (01_raw_articles.json)
+A JSON object with two top-level keys: meta and articles. meta records when the fetch happened and what parameters were used. articles is a list of normalized article objects.
+{
+  &quot;meta&quot;: {
+    &quot;fetched_at&quot;: &quot;2026-04-26T10:00:00Z&quot;,
+    &quot;from_date&quot;: &quot;2026-04-25&quot;,
+    &quot;section&quot;: &quot;film&quot;,
+    &quot;count&quot;: 23
+  },
+  &quot;articles&quot;: [
+    {
+      &quot;id&quot;: &quot;film/2026/apr/26/dune-three-wraps-villeneuve&quot;,
+      &quot;title&quot;: &quot;Dune: Part Three wraps after 14-month shoot&quot;,
+      &quot;trail&quot;: &quot;Villeneuve calls it &apos;the most ambitious of my career&apos;.&quot;,
+      &quot;body&quot;: &quot;Director Denis Villeneuve has confirmed... [full text]&quot;,
+      &quot;byline&quot;: &quot;Andrew Pulver&quot;,
+      &quot;wordcount&quot;: 412,
+      &quot;published_at&quot;: &quot;2026-04-26T08:30:00Z&quot;,
+      &quot;url&quot;: &quot;https://www.theguardian.com/film/2026/apr/26/...&quot;
+    }
+  ]
+}
+4.4 Implementation notes
+Use the requests library with a 30-second timeout per call.
+Retry up to 3 times on 5xx responses with exponential backoff (1s, 2s, 4s).
+On 429 (rate-limited): sleep for 60 seconds and retry once.
+Strip articles where bodyText is empty or under 100 words — these are usually picture galleries or stub pages.
+Drop articles where byline is empty AND title contains &apos;Live&apos; (Guardian&apos;s live blogs are rarely useful for our format).
+4.5 Failure modes
+Zero articles returned: Continue the pipeline. The script writer will be told to acknowledge it (&apos;Quiet day at the box office...&apos;). Do not fail the workflow.
+API down or auth error: Hard fail with a clear log line. The workflow run fails, no episode published that day.
+Partial results (some articles missing body): Drop the bad ones, log a warning, continue if at least 5 valid articles remain.
+5. Stage 2 — Rank
+5.1 Goal
+Reduce the 15 to 40 articles from Stage 1 to the 6 to 10 that will actually appear in the episode, ranked from most to least important. This is editorial judgment, not deduplication.
+5.2 Approach
+Two-step LLM process. Step A scores each article individually on three criteria. Step B sorts by score and applies a variety filter. Doing it in two steps (rather than one big &apos;pick 8 from these 30&apos; call) gives more consistent results — the model is asked to do one focused thing per call.
+5.2.1 Step A — score each article
+For each article, one cheap LLM call returns a JSON object with three integer scores from 1 to 5 plus a one-line rationale:
+{
+  &quot;id&quot;: &quot;film/2026/apr/26/dune-three-wraps-villeneuve&quot;,
+  &quot;newsworthiness&quot;: 5,    // major event / wide impact / hard news
+  &quot;audibility&quot;:     4,    // reads well aloud (not data-/photo-heavy)
+  &quot;freshness&quot;:      5,    // 5 = today, 1 = older than 24h
+  &quot;category&quot;:       &quot;news&quot;,  // news | review | interview | opinion | other
+  &quot;rationale&quot;:      &quot;Major franchise milestone, well-known director.&quot;
+}
+5.2.2 Step B — select &amp; order
+Pure Python, no LLM. Sort by sum-of-scores descending, then apply the variety filter:
+Take the top 8 by total score as candidates.
+If 5+ candidates share a category (e.g. all reviews), drop the lowest-scoring duplicates and pull from the next tier.
+If 3+ candidates are about the same film (heuristic: shared significant noun in title), keep only the highest-scoring.
+Always include at least one non-news item if available (a review or interview), for tonal variety.
+Final list: 6 to 10 items, ordered by total score.
+5.3 Model recommendation
+Primary: google/gemini-2.0-flash-exp — fast, cheap, reliable on structured output.
+Alt: deepseek/deepseek-chat — different vendor, similar tier.
+Verify pricing on OpenRouter before locking. 
+5.4 Output schema (02_ranked.json)
+{
+  &quot;meta&quot;: { &quot;model&quot;: &quot;google/gemini-2.0-flash-exp&quot;, &quot;input_count&quot;: 23, &quot;output_count&quot;: 8 },
+  &quot;selected&quot;: [
+    { &quot;id&quot;: &quot;...&quot;, &quot;rank&quot;: 1, &quot;scores&quot;: {...}, &quot;rationale&quot;: &quot;...&quot; }
+  ],
+  &quot;rejected&quot;: [ { &quot;id&quot;: &quot;...&quot;, &quot;reason&quot;: &quot;low audibility&quot; } ]
+}
+5.5 Failure modes
+LLM returns malformed JSON for a given article — retry once with a stricter prompt; on second failure, give that article default-middle scores (3,3,3) and continue.
+Fewer than 5 articles survive variety filter — fall back to top-N-by-score regardless of variety. Log a warning.
+6. Stage 3 — Summarize
+6.1 Goal
+Compress each selected article&apos;s full body into roughly 80 to 120 words of dry, faithful, who/what/when/where summary plus a short list of explicit key facts. This is deliberately voiceless — the script writer in Stage 4 adds the personality. Keeping the two roles separate makes the sanity check in Stage 5 actually possible.
+6.2 Approach
+One LLM call per article, run in parallel using asyncio.gather. Cheap model. The prompt is strict: no opinions, no flourishes, no information not in the source.
+6.3 Prompt scaffold
+SYSTEM:
+You are a wire-service summarizer. You read one article and output a JSON
+object. You never invent facts. If a fact is not in the article, it is
+not in the summary.
+
+USER:
+Article title: {title}
+Article body:
+{body}
+
+Output a JSON object with exactly these fields:
+  - summary: 80-120 words. Plain prose. Who, what, when, where. No opinions.
+  - key_facts: 3-5 short strings, each a single fact (name, number, date, quote).
+  - source_url: the URL passed in.
+Output JSON only, no preamble.
+6.4 Model recommendation
+Primary: google/gemini-2.0-flash-exp
+Alt: meta-llama/llama-3.3-70b-instruct or qwen/qwen-2.5-72b-instruct
+6.5 Output schema (03_summaries.json)
+{
+  &quot;meta&quot;: { &quot;model&quot;: &quot;...&quot;, &quot;count&quot;: 8 },
+  &quot;items&quot;: [
+    {
+      &quot;id&quot;: &quot;film/2026/apr/26/dune-three-wraps&quot;,
+      &quot;rank&quot;: 1,
+      &quot;title&quot;: &quot;Dune: Part Three wraps after 14-month shoot&quot;,
+      &quot;summary&quot;: &quot;Director Denis Villeneuve announced Tuesday that...&quot;,
+      &quot;key_facts&quot;: [
+        &quot;Director: Denis Villeneuve&quot;,
+        &quot;Film: Dune: Part Three&quot;,
+        &quot;Shoot duration: 14 months&quot;,
+        &quot;Announcement date: Tuesday&quot;
+      ],
+      &quot;source_url&quot;: &quot;https://www.theguardian.com/film/...&quot;
+    }
+  ]
+}
+7. Stage 4 — Write (the personality stage)
+7.1 Goal
+Turn the ranked summaries into a single broadcast script in SSML, written in the DAN house voice. This is the most prompt-engineered stage in the pipeline and the one most worth iterating on. The output of this stage is what your audience actually hears, modulo TTS.
+7.2 Approach: draft + critique
+Two LLM calls. The first writes a draft. The second reads the draft and rewrites any parts that fall short of the style brief. This pattern outperforms a single big call for two reasons: each call has a single, focused job, and the critique pass effectively gets a fresh read of the work, which is hard to simulate in one prompt.
+7.3 The DAN house voice (style brief)
+Imagine Casey Kasem doing the movie news on a 1970s AM station. Specifically:
+Warm, knowing, slightly theatrical. Loves movies. Has opinions. Doesn&apos;t take itself too seriously.
+Uses contractions everywhere: it&apos;s, that&apos;s, we&apos;ll, here&apos;s.
+Short to medium sentences. Active voice. No commas-in-commas-in-commas.
+Signposts between stories: &apos;Meanwhile,&apos; &apos;Across town,&apos; &apos;In other news,&apos; &apos;From the festival circuit,&apos; &apos;At the box office.&apos;
+Numbers are spoken: &apos;a hundred and twenty million dollars,&apos; not &apos;$120M.&apos;
+Names are kept clean — pronunciation help is added by Stage 6, not the writer.
+No bullet points, headlines, &apos;firstly/secondly,&apos; or other text-shaped scaffolding.
+Never invents. Every name, number, date, and quote must trace back to the summaries.
+7.4 Episode structure
+Cold open / sig (10 to 15 sec): &apos;Good morning, this is your Daily Audio News film brief for [date]. Here&apos;s what&apos;s playing today.&apos;
+Top story (90 to 120 sec): the highest-ranked item, given the most texture.
+Two to three secondary stories (60 to 90 sec each).
+Rapid-fire roundup (60 to 90 sec total): 3 to 4 short hits, one or two sentences each.
+One review or lighter piece (60 to 90 sec): tonal change-up.
+Sign-off (10 to 15 sec): &apos;That&apos;s your film brief. I&apos;ll see you at the movies.&apos;
+7.5 SSML output rules
+The writer outputs SSML, not plain text. Specifically:
+Wrap the whole script in &lt;speak&gt; with the standard namespaces (see section 9.3).
+Use a single &lt;voice&gt; tag, with the voice name supplied via prompt variable.
+Wrap the body in &lt;mstts:express-as style=&apos;newscast&apos;&gt;.
+Use &lt;break time=&apos;...&apos;&gt; for pacing: 400–600ms between stories, 200–300ms within stories at natural pauses.
+Use &lt;emphasis level=&apos;moderate&apos;&gt; sparingly — once or twice per story max — on the most important phrase.
+Do not use &lt;prosody&gt; in the writer pass. Stage 6 handles per-segment prosody.
+Do not use &lt;phoneme&gt;. Stage 6 handles pronunciation overrides.
+7.6 Draft prompt scaffold
+SYSTEM:
+You are the writer for DAN, a daily film-news radio brief in old-school
+AM-radio style. You write SSML for Azure neural TTS using the newscast
+speaking style. You write for the ear, never for the eye.
+
+Strict rules:
+- 1200-1800 words total.
+- Follow the structure: cold open, top story, 2-3 mid stories,
+  rapid-fire roundup, one lighter piece, sign-off.
+- Use only facts from the supplied summaries. Never invent.
+- Output valid SSML. No prose preamble, no markdown.
+
+USER:
+Today&apos;s date: {date}
+Voice: {voice_name}
+Stories (ranked):
+{summaries_json}
+
+Write the full SSML script.
+7.7 Critique prompt scaffold
+SYSTEM:
+You are the editor for DAN. You read a draft script and rewrite it to
+better match the house style.
+
+Style: warm AM-radio anchor, contractions, short active sentences,
+signposting between stories, numbers spoken in words, no text-shaped
+scaffolding.
+
+Length target: 1200-1800 words. If outside that range, fix it.
+
+You preserve all facts from the draft. You do not add new facts.
+You output the revised SSML only.
+
+USER:
+Draft:
+{draft_ssml}
+
+Rewrite.
+7.8 Model recommendation
+This is the splurge stage. The script writer is what the listener actually hears.
+Primary draft: anthropic/claude-sonnet-4 — strong creative voice, follows length and structure constraints reliably.
+Primary critique: same model. The critique pass needs the same level of judgment as the draft.
+Alt: openai/gpt-4o or anthropic/claude-opus-4-7 for the draft on premium days.
+Budget alt: anthropic/claude-haiku-4-5 for cheaper experimentation.
+Verify current pricing on OpenRouter before locking. 
+7.9 Output (04_script.txt)
+A single text file containing the SSML document produced by the critique pass. The .txt extension is intentional — keeps it diff-friendly in git.
+If the critique pass output is shorter than 1,000 words or longer than 2,000 words, the stage logs a warning but still proceeds. A second critique pass triggered automatically would risk an infinite loop and is not worth it.
+8. Stage 5 — Sanity Check
+8.1 Goal
+Catch the case where the script writer hallucinated a name, number, date, or quote that isn&apos;t in the source summaries. This is the only safety net between you and an embarrassingly wrong fact in your podcast.
+8.2 Approach: extract-then-verify
+Two LLM calls again.
+Call A — extract claims: read the script, list every checkable factual claim (people, films, dates, numbers, quotes, awards). Output JSON list of strings.
+Call B — verify each claim: for each claim, check it against the summaries&apos; key_facts. Output: supported / unsupported / partial, with a one-line rationale.
+This split is more reliable than a single &apos;is this script faithful&apos; call because it forces the model to enumerate before judging — the same trick chain-of-thought is built on.
+8.3 Behavior on failure
+If any claim is marked unsupported:
+Save the verification report to 05_sanity.json.
+Save the bad script as 04_script.bad.txt for inspection.
+Trigger a one-shot rewrite: another call to the Stage 4 critique prompt, with the unsupported claims passed as additional context (&apos;these claims aren&apos;t in the source — fix them&apos;).
+Re-run sanity check on the rewrite.
+If it still fails, the workflow fails. No bad episode is published.
+8.4 Model recommendation
+Primary: google/gemini-2.0-flash-exp — literal comparison work, cheap model is fine.
+Alt: deepseek/deepseek-chat
+8.5 Output schema (05_sanity.json)
+{
+  &quot;meta&quot;: { &quot;model&quot;: &quot;...&quot;, &quot;passed&quot;: true, &quot;rewrites&quot;: 0 },
+  &quot;claims&quot;: [
+    { &quot;text&quot;: &quot;Denis Villeneuve directed Dune: Part Three&quot;,
+      &quot;status&quot;: &quot;supported&quot;,
+      &quot;evidence&quot;: &quot;key_fact: Director: Denis Villeneuve&quot; },
+    { &quot;text&quot;: &quot;The film cost $300 million&quot;,
+      &quot;status&quot;: &quot;unsupported&quot;,
+      &quot;evidence&quot;: &quot;no budget mentioned in any summary&quot; }
+  ]
+}
+9. Stage 6 — Audio Prep
+9.1 Goal
+Take the validated script SSML and prepare it for TTS: apply pronunciation overrides, validate the SSML against Azure&apos;s schema, and chunk it into TTS-sized requests.
+9.2 Pronunciation overrides
+Maintained in config/pronunciations.yaml. Each entry maps a literal name (or pattern) to either an SSML &lt;phoneme&gt; tag or a &lt;sub&gt; tag for plain respelling.
+# config/pronunciations.yaml
+overrides:
+  - match: &quot;Saoirse Ronan&quot;
+    replacement: &apos;&lt;phoneme alphabet=&quot;ipa&quot; ph=&quot;ˈsɜrʃə ˈroʊnən&quot;&gt;Saoirse Ronan&lt;/phoneme&gt;&apos;
+  - match: &quot;Chalamet&quot;
+    replacement: &apos;&lt;sub alias=&quot;SHAL-uh-may&quot;&gt;Chalamet&lt;/sub&gt;&apos;
+  - match: &quot;Iñárritu&quot;
+    replacement: &apos;&lt;phoneme alphabet=&quot;ipa&quot; ph=&quot;iˈɲaritu&quot;&gt;Iñárritu&lt;/phoneme&gt;&apos;
+  - match: &quot;Villeneuve&quot;
+    replacement: &apos;&lt;sub alias=&quot;vil-NUHV&quot;&gt;Villeneuve&lt;/sub&gt;&apos;
+Application is a simple text substitution pass over the script SSML. Whole-word match only. Order matters: longer matches first to prevent partial replacements.
+9.3 SSML validation
+Validate the document against Azure&apos;s expected shape before sending to TTS. Specifically check:
+Root &lt;speak&gt; element with version=&apos;1.0&apos; and required namespaces.
+xmlns=&apos;http://www.w3.org/2001/10/synthesis&apos;
+xmlns:mstts=&apos;http://www.w3.org/2001/mstts&apos;
+xml:lang=&apos;en-US&apos;
+Single &lt;voice&gt; with name attribute matching a known Azure voice.
+Well-formed XML (use Python&apos;s lxml library, fail loudly on parse errors).
+9.4 Chunking
+Azure&apos;s per-request limit is 10 minutes of synthesized audio (around 9,000 to 10,000 chars of input is a safe rule of thumb, less if heavy SSML markup). Our scripts are around 9,000 chars, so we may fit in one chunk — but we always chunk anyway, for two reasons: it keeps individual request times under 30 seconds, and it makes retries cheap.
+Chunking rules:
+Split on &lt;break time=&apos;...&apos;&gt; tags between major segments (between cold open and top story, between stories, before the sign-off).
+Never split inside an &lt;mstts:express-as&gt; block — close it on each side of the split.
+Each chunk is wrapped in its own valid &lt;speak&gt; document.
+Aim for chunks of 2,000 to 4,000 characters.
+9.5 Outputs
+06_ssml.xml: the full prepped SSML document with pronunciation overrides applied. For audit/debug.
+06_chunks/: a directory of numbered SSML files (chunk_01.xml, chunk_02.xml, etc.). Each is independently valid SSML.
+10. Stage 7 — TTS
+10.1 Goal
+Convert each SSML chunk into an MP3 audio file using the configured TTS provider.
+10.2 The TTSProvider abstraction
+All TTS access is through the abstraction. The interface:
+class TTSProvider(Protocol):
+    def synthesize(self, ssml: str) -&gt; bytes:
+        &quot;&quot;&quot;Synthesize SSML to audio bytes (MP3).
+        Raises TTSError on failure.&quot;&quot;&quot;
+        ...
+
+    @property
+    def name(self) -&gt; str: ...
+
+    @property
+    def voice(self) -&gt; str: ...
+10.3 Azure implementation
+Concrete class AzureTTSProvider implements the protocol using azure-cognitiveservices-speech.
+Reads AZURE_SPEECH_KEY and AZURE_SPEECH_REGION from environment.
+Output format: Audio24Khz48KBitRateMonoMp3 — good middle ground for podcast use.
+Per-chunk: speak_ssml_async(ssml).get(); on success returns result.audio_data.
+Retries once on transient errors (network, 5xx); fails the workflow on the second attempt.
+Logs character count consumed per call for free-tier monitoring.
+10.4 Switching providers
+To switch to Google or Polly later: implement a new class against the Protocol, point the pipeline config at it. The rest of the pipeline does not change.
+10.5 Output (07_audio_chunks/)
+Numbered MP3 files matching the chunk numbers from Stage 6: chunk_01.mp3, chunk_02.mp3, etc.
+10.6 Cost monitoring
+Each run logs total characters sent to TTS to logs/YYYY-MM-DD/tts_chars.txt. A separate monthly aggregator reads these files and warns at 4M chars/month (80% of free tier).
+11. Stage 8 — Stitch
+11.1 Goal
+Concatenate the per-chunk MP3s into a single final episode MP3 with consistent loudness and proper ID3 tags.
+11.2 Concatenation
+Use ffmpeg&apos;s concat demuxer. It joins MP3s without re-encoding, which is fast and lossless. Generate a temp file listing the chunks in order, then:
+ffmpeg -f concat -safe 0 -i concat_list.txt -c copy joined.mp3
+11.3 Loudness normalization
+Run ffmpeg&apos;s loudnorm filter to bring the final episode to the EBU R128 podcast standard (-16 LUFS integrated, -1.5 dB true peak). Without this, episodes drift in volume between days. With it, every episode lands at the same perceived loudness, which is what makes a podcast feel professional.
+ffmpeg -i joined.mp3 \
+  -af loudnorm=I=-16:TP=-1.5:LRA=11 \
+  -ar 44100 -b:a 96k \
+  08_episode.mp3
+11.4 ID3 tags
+Use the mutagen Python library to set ID3 tags on the final MP3. These show up in podcast apps&apos; episode lists and metadata views.
+TIT2 (title)         : &quot;DAN Film Brief — {YYYY-MM-DD}&quot;
+TPE1 (artist)        : &quot;Daily Audio News&quot;
+TALB (album)         : &quot;Daily Audio News — Film&quot;
+TDRC (year)          : &quot;{YYYY}&quot;
+TCON (genre)         : &quot;Podcast&quot;
+TRCK (track)         : &quot;{episode_number}&quot;
+11.5 Output (08_episode.mp3)
+The final episode, ready to publish. Should be 8 to 12 minutes and 6 to 10 MB.
+12. Stage 9 — Publish (Upload + RSS)
+12.1 Goal
+Upload the episode to object storage and update the podcast RSS feed so Apple Podcasts picks it up. This is the V1 territory — V2 keeps V1&apos;s design.
+12.2 Object storage layout
+R2 bucket: dan-podcast
+  /feed.xml                                     &lt;- RSS feed
+  /artwork/show-cover.jpg                        &lt;- static, set once
+  /episodes/2026/04/dan-film-2026-04-26.mp3      &lt;- per-episode
+12.3 The ObjectStore abstraction
+R2 is S3-compatible, but we still wrap it. Interface:
+class ObjectStore(Protocol):
+    def put(self, key: str, data: bytes, content_type: str) -&gt; None: ...
+    def url_for(self, key: str) -&gt; str: ...
+    def exists(self, key: str) -&gt; bool: ...
+Implementation uses boto3 with the R2 endpoint and credentials from environment.
+12.4 Upload
+Upload 08_episode.mp3 to /episodes/YYYY/MM/dan-film-YYYY-MM-DD.mp3.
+Set Content-Type: audio/mpeg.
+After upload, HEAD-request the public URL to confirm it&apos;s reachable.
+Capture the byte length of the uploaded file — needed for the RSS enclosure.
+12.5 RSS feed update
+The feed is a single feed.xml file. Each episode is an &lt;item&gt;. Generation logic:
+Download current feed.xml from R2 if it exists. If not, scaffold a fresh one from config/show.yaml.
+Parse with feedgen (Python library) — handles RSS 2.0 and the iTunes/Apple Podcasts namespace correctly.
+Append a new &lt;item&gt; for today&apos;s episode.
+Sort items by pubDate descending; cap at the last 50 episodes.
+Re-serialize and upload as feed.xml. Set Content-Type: application/rss+xml.
+12.6 Episode description
+One additional cheap LLM call (Stage 9.1) takes the script and produces a 2 to 3 sentence episode description for the RSS &lt;item&gt;&lt;description&gt;. This is what shows up under the episode title in Apple Podcasts.
+SYSTEM:
+You write 2-3 sentence episode descriptions for a film-news podcast.
+Plain prose. No emojis. Under 300 characters total.
+
+USER:
+Episode script:
+{script}
+
+Write the description.
+12.7 Required RSS fields (channel level)
+title — &apos;Daily Audio News — Film&apos;
+description — show description from config/show.yaml
+language — en-us
+link — anything stable, even just the artwork URL
+itunes:author
+itunes:image (HTTPS URL to artwork, square, 1400x1400px or larger)
+itunes:category — &apos;News&apos; or &apos;Arts &gt; Performing Arts&apos;
+itunes:explicit — &apos;false&apos;
+lastBuildDate — RFC 822 format
+12.8 Required RSS fields (item level)
+title
+description (from section 12.6)
+pubDate — RFC 822 format (NOT ISO 8601 — common bug)
+enclosure — url, length (bytes), type=&apos;audio/mpeg&apos;
+guid — stable per episode (use the episode&apos;s URL)
+itunes:duration — &apos;HH:MM:SS&apos; or seconds
+13. Configuration
+13.1 Files in config/
+show.yaml: show-level RSS metadata. Title, description, author, artwork URL, default category. Set once.
+models.yaml: which model to use for which stage. Editable without touching code.
+pronunciations.yaml: name to phoneme/sub mappings (see section 9.2).
+voice.yaml: TTS voice name and provider. Easy switch point.
+13.2 models.yaml example
+# config/models.yaml
+rank:        google/gemini-2.0-flash-exp
+summarize:   google/gemini-2.0-flash-exp
+write_draft: anthropic/claude-sonnet-4
+write_critique: anthropic/claude-sonnet-4
+sanity_extract: google/gemini-2.0-flash-exp
+sanity_verify:  google/gemini-2.0-flash-exp
+describe:    google/gemini-2.0-flash-exp
+13.3 voice.yaml example
+# config/voice.yaml
+provider: azure
+voice: en-US-AndrewMultilingualNeural
+style: newscast
+output_format: Audio24Khz48KBitRateMonoMp3
+14. Orchestration &amp; Runtime
+14.1 GitHub Actions workflow
+File: .github/workflows/daily.yml. Triggers on a daily cron and on workflow_dispatch (manual run button).
+name: dan-daily
+on:
+  schedule:
+    - cron: &quot;0 11 * * *&quot;   # 11:00 UTC = 6:00 AM Central
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: &quot;3.11&quot; }
+      - run: sudo apt-get install -y ffmpeg
+      - run: pip install -r requirements.txt
+      - run: python -m dan.pipeline
+        env:
+          GUARDIAN_API_KEY:       ${{ secrets.GUARDIAN_API_KEY }}
+          OPENROUTER_API_KEY:     ${{ secrets.OPENROUTER_API_KEY }}
+          AZURE_SPEECH_KEY:       ${{ secrets.AZURE_SPEECH_KEY }}
+          AZURE_SPEECH_REGION:    ${{ secrets.AZURE_SPEECH_REGION }}
+          R2_ACCOUNT_ID:          ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID:       ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:   ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET:              ${{ secrets.R2_BUCKET }}
+          FEED_BASE_URL:          ${{ secrets.FEED_BASE_URL }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-run-logs
+          path: logs/
+14.2 Why these scheduling choices
+11:00 UTC means 6:00 AM Central — the brief is ready before you wake up.
+GitHub Actions cron is best-effort and may drift 5 to 15 minutes. Acceptable for a daily brief.
+workflow_dispatch is essential — it&apos;s how you re-run on a failure or test changes.
+On failure, logs/ is uploaded as an artifact so you can debug from the run page.
+14.3 Local development mode
+python -m dan.pipeline --local runs the pipeline against a fixtures directory of pre-recorded responses. This makes prompt iteration free and fast — change the script writer prompt, re-run, listen, repeat. Fixtures are stored in tests/fixtures/ and committed to git.
+15. Secrets &amp; Setup Checklist
+Every secret lives in GitHub repository secrets, never in code or config files. Order of operations for first-time setup:
+Create a Cloudflare account, create R2 bucket dan-podcast, generate API token. Note bucket name, account ID, access key, secret key, and the public URL of the bucket.
+Create an Azure account, create a Speech resource on the F0 free tier. Note the key and region.
+Create a Guardian Open Platform developer account, request a free API key.
+Create an OpenRouter account, generate an API key, fund it with $5 (lasts months at our volume).
+Create the GitHub repository for DAN. Add all secrets via Settings then Secrets and variables then Actions.
+Upload show artwork (1400x1400 JPG, square) to R2 at /artwork/show-cover.jpg.
+Once the workflow runs successfully once, take the feed URL and add it to Apple Podcasts via File then Add Show by URL.
+16. Repo Layout
+dan/
+  __init__.py
+  pipeline.py              # top-level orchestrator + CLI
+  config.py                # loads YAML configs, validates schemas
+  paths.py                 # logs/YYYY-MM-DD/ helpers
+  io.py                    # JSON/text read/write with schema validation
+
+  sources/
+    guardian.py            # Stage 1
+
+  llm/
+    openrouter.py          # OpenRouter HTTP client
+    rank.py                # Stage 2
+    summarize.py           # Stage 3
+    write.py               # Stage 4 (draft + critique)
+    sanity.py              # Stage 5 (extract + verify)
+    describe.py            # Stage 9.1 (episode description)
+
+  audio/
+    prep.py                # Stage 6 (pronunciation, validation, chunking)
+    tts.py                 # Stage 7 (TTSProvider protocol + Azure impl)
+    stitch.py              # Stage 8 (concat, loudnorm, ID3)
+
+  publish/
+    store.py               # ObjectStore protocol + R2 impl
+    upload.py              # episode upload
+    rss.py                 # feed.xml generation/update
+
+  prompts/
+    rank_score.txt
+    summarize.txt
+    write_draft.txt
+    write_critique.txt
+    sanity_extract.txt
+    sanity_verify.txt
+    describe.txt
+
+config/
+  show.yaml
+  models.yaml
+  voice.yaml
+  pronunciations.yaml
+
+tests/
+  fixtures/                # canned responses for local mode
+  test_*.py                # unit tests per module
+
+logs/                      # gitignored, per-run artifacts
+.github/workflows/daily.yml
+requirements.txt
+README.md
+17. Implementation Phases
+Build in this order. Each phase is shippable on its own — even Phase 1 produces a real (if rough) episode you can listen to.
+Phase 1 — Walking skeleton (1 to 2 evenings)
+Goal: produce one playable MP3 from one day&apos;s Guardian articles, run by hand, on your laptop. Cut every corner. Hard-code paths and the voice. Skip the sanity check. Skip the rank stage entirely (just take the first 8 articles). Use a single LLM call for the script writer (no critique pass).
+Deliverable: a sample.mp3 that, when played, sounds like a recognizable but rough version of DAN.
+Phase 2 — Quality pass (1 weekend)
+Add the rank stage with proper scoring. Add the draft + critique pattern to the script writer. Add the sanity check. Build the pronunciations file. Iterate on the script writer prompt by listening to 3 to 5 days of output.
+Deliverable: an MP3 that sounds intentional, like a real show with a real host, not a robot reading articles.
+Phase 3 — Publishing (1 evening)
+Wire up R2 upload, feed.xml generation, and HTTPS hosting. Subscribe in Apple Podcasts. Run the pipeline manually for a week to confirm everything works end-to-end.
+Deliverable: new episodes appear in your podcast app within an hour of running the pipeline.
+Phase 4 — Automation (1 evening)
+Move runtime to GitHub Actions. Wire up secrets. Set the cron schedule. Confirm a week of unattended daily runs.
+Deliverable: you stop running anything by hand.
+Phase 5 — Iterate (forever)
+Listen. Note the three most annoying things. Fix them. Repeat. The prompts are the product. Expect to keep tuning them.
+18. Consolidated Failure Modes
+Drawn from V1 and expanded for V2. Each is paired with what V2 does about it.
+18.1 Pipeline-level
+Guardian API down: hard fail with clear log. No episode that day. (section 4.5)
+Zero articles in last 24h: continue, writer acknowledges quiet day. (section 4.5)
+LLM call fails (transient): retry once, then fail.
+Hallucinated facts in script: sanity check catches; one rewrite attempt; then fail. (section 8.3)
+TTS rate-limited: 60s sleep then retry; second failure is hard fail.
+Free-tier exhausted: monthly aggregator warns at 80% (section 10.6).
+18.2 RSS / publishing
+Invalid RSS XML: validated with feedgen library before upload.
+Wrong pubDate format: RFC 822 enforced by feedgen, not hand-formatted.
+Missing enclosure length: byte-length captured at upload, not estimated.
+Broken episode URL: HEAD-request after upload to confirm reachability.
+MP3 not publicly accessible: R2 bucket configured for public read; HEAD check confirms.
+18.3 Editorial / quality
+Script too short or too long: logged warning at &lt;1000 or &gt;2000 words; not a hard fail.
+Names mispronounced: add to pronunciations.yaml; rerun affects only future episodes.
+Boring episode: no automated fix. Phase 5 listening + prompt iteration is the answer.
+Pipeline silently produces bad output: only listening catches this. Build the habit.
+19. Glossary
+DAN: Daily Audio News. The show.
+Brief: One day&apos;s episode.
+SSML: Speech Synthesis Markup Language. The XML markup that controls TTS prosody, pauses, emphasis, and pronunciation.
+OpenRouter: Aggregator that gives one API key access to dozens of LLM providers.
+R2: Cloudflare&apos;s S3-compatible object storage. Where episodes and the RSS feed live.
+LUFS: Loudness Units Full Scale. Industry-standard perceived-loudness measurement. Podcasts target -16 LUFS.
+Newscast style: Azure&apos;s mstts:express-as preset that biases the voice toward broadcast delivery.
+20. Open Questions for V2.5+
+Does the host get a name and a backstory the writer prompt can lean on?
+Add a brief weekend wrap-up episode covering the week?
+Light music sting between segments?
+Expand to a second beat (TV? streaming?) as a separate show on the same pipeline?
+When does multi-source verification become worth the complexity?
+Local-first archive (mirror episodes to local disk too, in case R2 eats them)?

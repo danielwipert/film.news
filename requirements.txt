@@ -1,0 +1,7 @@
+requests
+pyyaml
+lxml
+feedgen
+mutagen
+boto3
+azure-cognitiveservices-speech

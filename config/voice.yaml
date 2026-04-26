@@ -1,0 +1,4 @@
+provider: azure
+voice: en-US-AndrewMultilingualNeural
+style: newscast
+output_format: Audio24Khz48KBitRateMonoMp3

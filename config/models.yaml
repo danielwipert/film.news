@@ -1,0 +1,8 @@
+# Per-stage model selection. Editable without touching code.
+rank:            google/gemini-2.0-flash-exp
+summarize:       google/gemini-2.0-flash-exp
+write_draft:     anthropic/claude-sonnet-4
+write_critique:  anthropic/claude-sonnet-4
+sanity_extract:  google/gemini-2.0-flash-exp
+sanity_verify:   google/gemini-2.0-flash-exp
+describe:        google/gemini-2.0-flash-exp
