@@ -147,15 +147,17 @@ def test_select_keeps_top_when_no_variety_issues():
     # existed; here all are news, so no swap happens. Selected stays all news.
 
 
-def test_select_swaps_in_non_news_when_all_top_are_news():
-    # 12 news + 1 lower-scoring review. After category-dominance prune and
-    # refill, candidates are still all news; _ensure_non_news swaps the review in.
+def test_select_includes_non_news_when_top_are_all_news():
+    """Spec §5.2.2: include at least one non-news item when one is available.
+
+    Regardless of which code path delivers it (category-aware refill or the
+    explicit ensure-non-news swap), the outcome is the same.
+    """
     scored = [_score(f"a{i:02d}", 5, 5, 5, "news") for i in range(12)]
     scored.append(_score("rev99", 1, 1, 1, "review"))
     titles = {s["id"]: _unique_title(i) for i, s in enumerate(scored)}
-    selected, rejected = rank._select_with_variety(scored, titles)
-    assert any(s["category"] != "news" for s in selected), "non-news should be swapped in"
-    assert any("variety" in r["reason"] for r in rejected)
+    selected, _ = rank._select_with_variety(scored, titles)
+    assert any(s["category"] != "news" for s in selected), "non-news must appear in selected"
 
 
 def test_select_prunes_same_film_anchor():
@@ -194,6 +196,22 @@ def test_select_prunes_category_dominance():
     review_count = sum(1 for s in selected if s["category"] == "review")
     assert review_count < rank.SAME_CATEGORY_LIMIT, "category dominance should have been pruned"
     assert any("category" in r["reason"] for r in rejected)
+
+
+def test_select_dominance_refill_does_not_re_trigger_dominance():
+    """After dominance pruning, refill must skip the dominant category.
+
+    Regression: with 12 high-scoring news + 5 lower reviews, naive refill picked
+    the next 4 news after dropping the bottom 4 — re-establishing dominance.
+    """
+    scored = [_score(f"news{i:02d}", 5, 5, 5, "news") for i in range(12)]
+    scored += [_score(f"rev{i:02d}", 4, 3, 3, "review") for i in range(5)]
+    titles = {s["id"]: _unique_title(i) for i, s in enumerate(scored)}
+    selected, _ = rank._select_with_variety(scored, titles)
+    news_count = sum(1 for s in selected if s["category"] == "news")
+    review_count = sum(1 for s in selected if s["category"] == "review")
+    assert news_count < rank.SAME_CATEGORY_LIMIT, f"news count {news_count} re-triggered dominance"
+    assert review_count >= 1, "expected variety from non-dominant category"
 
 
 def test_select_handles_empty_input():

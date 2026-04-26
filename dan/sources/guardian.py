@@ -118,18 +118,24 @@ def _passes_filters(a: dict[str, Any]) -> bool:
     return True
 
 
-def fetch(d: date | None = None) -> Path:
-    """Fetch articles published since (d - 1 day) and write 01_raw_articles.json.
+def fetch(d: date | None = None, *, days_back: int = 1) -> Path:
+    """Fetch articles published since (d - days_back) and write 01_raw_articles.json.
+
+    Production uses days_back=1 per spec §4.2. Higher values are intended for
+    local testing on quiet days when one day of Guardian film coverage is too
+    thin to exercise the rank/variety logic.
 
     Returns the output path. Raises FetchError on auth/API failure.
     """
     api_key = os.environ.get("GUARDIAN_API_KEY")
     if not api_key:
         raise FetchError("GUARDIAN_API_KEY not set")
+    if days_back < 1:
+        raise ValueError(f"days_back must be >= 1, got {days_back}")
 
     if d is None:
         d = today_utc()
-    from_date = (d - timedelta(days=1)).isoformat()
+    from_date = (d - timedelta(days=days_back)).isoformat()
 
     params = {
         "section": SECTION,

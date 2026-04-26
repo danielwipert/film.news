@@ -177,7 +177,10 @@ def _select_with_variety(
 
     candidates = _prune_same_film(candidates, titles_by_id, rejected, rejected_ids)
     candidates = _prune_category_dominance(candidates, rejected, rejected_ids)
-    candidates = _refill(candidates, all_sorted, TOP_CANDIDATES, exclude_ids=rejected_ids)
+    # Refill after pruning, but respect the category cap so we don't refill the
+    # same dominant category back in (which would re-trigger dominance).
+    candidates = _refill(candidates, all_sorted, TOP_CANDIDATES,
+                         exclude_ids=rejected_ids, respect_category_cap=True)
     candidates = _ensure_non_news(candidates, all_sorted, rejected, rejected_ids)
 
     # §5.5 fallback if variety prune left us thin.
@@ -213,17 +216,27 @@ def _refill(
     target: int,
     *,
     exclude_ids: set[str],
+    respect_category_cap: bool = False,
 ) -> list[dict[str, Any]]:
-    """Top up candidates from the next tier of all_sorted, skipping rejected ids."""
+    """Top up candidates from the next tier, skipping rejected ids.
+
+    If respect_category_cap is True, skip items whose category is already at
+    SAME_CATEGORY_LIMIT - 1 in the current selection — so refill never pushes
+    a category back over the dominance threshold we just pruned to.
+    """
     out = list(candidates)
     selected = {s["id"] for s in out}
+    counts = Counter(s["category"] for s in out)
     for s in all_sorted:
         if len(out) >= target:
             break
         if s["id"] in selected or s["id"] in exclude_ids:
             continue
+        if respect_category_cap and counts[s["category"]] + 1 >= SAME_CATEGORY_LIMIT:
+            continue
         out.append(s)
         selected.add(s["id"])
+        counts[s["category"]] += 1
     return out
 
 

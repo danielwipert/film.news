@@ -33,6 +33,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=STAGES,
         help="Run a single stage instead of the full pipeline.",
     )
+    parser.add_argument(
+        "--days-back",
+        type=int,
+        default=1,
+        help="Fetch window in days (default 1 per spec; raise for testing on quiet days).",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -41,13 +47,13 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.only == "fetch":
-        guardian.fetch()
+        guardian.fetch(days_back=args.days_back)
     elif args.only == "rank":
         rank.rank()
     elif args.only == "summarize":
         summarize.summarize()
     else:
-        guardian.fetch()
+        guardian.fetch(days_back=args.days_back)
         rank.rank()
         summarize.summarize()
     return 0
