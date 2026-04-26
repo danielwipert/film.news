@@ -1,6 +1,6 @@
 """Top-level orchestrator + CLI. Runs stages 1-9 in sequence.
 
-Currently wired stages: 1 (fetch). Subsequent stages will be added as they land.
+Currently wired stages: 1 (fetch), 2 (rank). Subsequent stages added as they land.
 """
 from __future__ import annotations
 
@@ -10,12 +10,15 @@ import sys
 
 from dotenv import load_dotenv
 
+from dan.llm import rank
 from dan.paths import ROOT
 from dan.sources import guardian
 
 # Auto-load .env for local dev. override=False so GitHub Actions secrets
 # (which arrive as real env vars) always win.
 load_dotenv(ROOT / ".env", override=False)
+
+STAGES = ("fetch", "rank")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,6 +28,11 @@ def main(argv: list[str] | None = None) -> int:
         default="INFO",
         help="Python logging level (DEBUG, INFO, WARNING, ERROR).",
     )
+    parser.add_argument(
+        "--only",
+        choices=STAGES,
+        help="Run a single stage instead of the full pipeline.",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -32,7 +40,13 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    guardian.fetch()
+    if args.only == "fetch":
+        guardian.fetch()
+    elif args.only == "rank":
+        rank.rank()
+    else:
+        guardian.fetch()
+        rank.rank()
     return 0
 
 
