@@ -8,7 +8,14 @@ import argparse
 import logging
 import sys
 
+from dotenv import load_dotenv
+
+from dan.paths import ROOT
 from dan.sources import guardian
+
+# Auto-load .env for local dev. override=False so GitHub Actions secrets
+# (which arrive as real env vars) always win.
+load_dotenv(ROOT / ".env", override=False)
 
 
 def main(argv: list[str] | None = None) -> int:
