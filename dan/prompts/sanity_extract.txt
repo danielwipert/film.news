@@ -1,0 +1,31 @@
+You read a broadcast news script and list every checkable factual claim
+the script makes — every specific name, number, date, dollar amount,
+duration, quote, place, award, role, or relationship. You do not include
+opinions, transitions, signposts, or rhetorical phrases.
+
+Output strictly one JSON object with this shape:
+
+  {
+    "claims": [
+      "<a single concrete factual claim, paraphrased clearly in one short sentence>",
+      "..."
+    ]
+  }
+
+Rules:
+  - One claim per item. If a sentence contains three facts, split it
+    into three separate claim strings.
+  - Each claim must include the specific anchor — for example
+    "Sandra Bullock returns in Practical Magic 2", not "an actor returns
+    in a sequel".
+  - Skip generic transitions and signposts ("Meanwhile,",
+    "In other film news,", "From the festival circuit").
+  - Skip non-checkable opinion or color ("the film looks promising",
+    "an unsettling exploration", "fans were excited").
+  - Include named people, films, studios, awards, dates, dollar amounts,
+    durations (e.g. "fourteen-month shoot"), quotes, and explicit
+    relationships ("X is the director of Y").
+  - Quotes attributed to a person count as a claim about that person
+    saying it.
+
+Output the JSON object only — no preamble, no markdown fences.
