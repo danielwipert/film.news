@@ -271,6 +271,41 @@ def test_prep_clears_stale_chunks_from_prior_run(monkeypatch, tmp_path):
     assert (chunks_dir / "chunk_01.xml").exists()
 
 
+def test_prep_overrides_voice_from_config(monkeypatch, tmp_path):
+    """Regression: voice.yaml must override the voice baked into the source
+    SSML, otherwise Azure honors the SSML <voice> tag and ignores the SDK
+    config — meaning a voice change in voice.yaml has no effect until we
+    rewrite the chunks."""
+    monkeypatch.setattr(prep, "log_dir", lambda d=None: tmp_path)
+    monkeypatch.setattr(prep.config, "pronunciations", lambda: [])
+    monkeypatch.setattr(prep.config, "voice", lambda: {"voice": "en-US-DavisNeural"})
+
+    body = "One.<break time='500ms'/>Two."
+    # Source has Andrew baked in (e.g. from when the writer ran)
+    src = _wrap(body, voice="en-US-AndrewMultilingualNeural")
+    (tmp_path / "04_script.txt").write_text(src, encoding="utf-8")
+
+    out_path = prep.prep()
+    full = out_path.read_text(encoding="utf-8")
+    assert 'name="en-US-DavisNeural"' in full
+    assert "Andrew" not in full
+
+    for chunk_file in sorted((tmp_path / "06_chunks").glob("chunk_*.xml")):
+        c = chunk_file.read_text(encoding="utf-8")
+        assert 'name="en-US-DavisNeural"' in c
+        assert "Andrew" not in c
+
+
+def test_chunk_ssml_voice_name_override():
+    body = "One.<break time='500ms'/>Two."
+    src = _wrap(body, voice="en-US-AndrewMultilingualNeural")
+    chunks = prep.chunk_ssml(src, voice_name="en-US-DavisNeural")
+    for c in chunks:
+        root = etree.fromstring(c.encode("utf-8"))
+        voice = root.find(prep._qn("voice"))
+        assert voice.get("name") == "en-US-DavisNeural"
+
+
 def test_prep_raises_on_invalid_ssml_input(monkeypatch, tmp_path):
     monkeypatch.setattr(prep, "log_dir", lambda d=None: tmp_path)
     monkeypatch.setattr(prep.config, "pronunciations", lambda: [])

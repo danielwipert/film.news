@@ -212,16 +212,25 @@ def _build_chunk_doc(segments: list[str], voice_name: str, style: str) -> str:
     )
 
 
-def chunk_ssml(ssml: str, *, target_chars: int = TARGET_CHUNK_CHARS) -> list[str]:
+def chunk_ssml(
+    ssml: str,
+    *,
+    target_chars: int = TARGET_CHUNK_CHARS,
+    voice_name: str | None = None,
+) -> list[str]:
     """Split a validated SSML doc into one or more <speak> chunks.
 
     Splits only at long-break boundaries inside the <mstts:express-as>
     block; never inside an express-as. Each returned chunk is a complete,
     independently valid SSML document.
+
+    If `voice_name` is given, it overrides the voice in the source SSML —
+    Azure's TTS honors the SSML <voice> tag over any SDK-level config, so
+    the chunks must carry the voice we actually want to synthesize.
     """
     root = validate_ssml(ssml)
     voice_el = root.find(_qn("voice"))
-    voice_name = voice_el.get("name", DEFAULT_VOICE)
+    chunk_voice = voice_name if voice_name is not None else voice_el.get("name", DEFAULT_VOICE)
     express_as = voice_el.find(_qn("express-as", MSTTS_NS))
     if express_as is None:
         raise SsmlError("no <mstts:express-as> element inside <voice>")
@@ -232,7 +241,20 @@ def chunk_ssml(ssml: str, *, target_chars: int = TARGET_CHUNK_CHARS) -> list[str
         raise SsmlError("express-as body produced zero segments")
 
     grouped = _group_into_chunks(segments, target_chars=target_chars)
-    return [_build_chunk_doc(group, voice_name, style) for group in grouped]
+    return [_build_chunk_doc(group, chunk_voice, style) for group in grouped]
+
+
+def _set_voice_in_ssml(ssml: str, voice_name: str) -> str:
+    """Rewrite the `name` attribute on the single <voice> element."""
+    root = etree.fromstring(ssml.encode("utf-8"))
+    voice_el = root.find(_qn("voice"))
+    if voice_el is None:
+        raise SsmlError("no <voice> element to retag")
+    voice_el.set("name", voice_name)
+    body = etree.tostring(root, encoding="unicode")
+    if not body.lstrip().startswith("<?xml"):
+        body = '<?xml version="1.0" encoding="UTF-8"?>\n' + body
+    return body
 
 
 # ---------- pipeline entry ----------
@@ -258,6 +280,12 @@ def prep(d: date | None = None) -> Path:
     log.info("prep: validating SSML")
     validate_ssml(prepped)
 
+    # Apply the configured voice to both the full prepped doc and the chunks.
+    # Azure's TTS honors the SSML <voice> tag over any SDK config, so changing
+    # voice.yaml only takes effect if we actually rewrite the SSML here.
+    log.info("prep: setting voice to %s", voice_name)
+    prepped = _set_voice_in_ssml(prepped, voice_name)
+
     ssml_path = day_dir / "06_ssml.xml"
     write_text(ssml_path, prepped)
 
@@ -267,7 +295,7 @@ def prep(d: date | None = None) -> Path:
     for old in chunks_dir.glob("chunk_*.xml"):
         old.unlink()
 
-    chunks = chunk_ssml(prepped)
+    chunks = chunk_ssml(prepped, voice_name=voice_name)
     for i, chunk_xml in enumerate(chunks, start=1):
         validate_ssml(chunk_xml)  # belt + suspenders: each chunk must independently parse
         chunk_path = chunks_dir / f"chunk_{i:02d}.xml"
