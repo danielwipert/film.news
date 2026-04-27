@@ -10,7 +10,7 @@ import sys
 
 from dotenv import load_dotenv
 
-from dan.audio import prep as prep_stage
+from dan.audio import prep as prep_stage, tts as tts_stage
 from dan.llm import rank, sanity, summarize, write as write_stage
 from dan.paths import ROOT
 from dan.sources import guardian
@@ -19,7 +19,7 @@ from dan.sources import guardian
 # (which arrive as real env vars) always win.
 load_dotenv(ROOT / ".env", override=False)
 
-STAGES = ("fetch", "rank", "summarize", "write", "sanity", "prep")
+STAGES = ("fetch", "rank", "summarize", "write", "sanity", "prep", "tts")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,6 +59,8 @@ def main(argv: list[str] | None = None) -> int:
         sanity.sanity()
     elif args.only == "prep":
         prep_stage.prep()
+    elif args.only == "tts":
+        tts_stage.synthesize_chunks()
     else:
         guardian.fetch(days_back=args.days_back)
         rank.rank()
@@ -66,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         write_stage.write()
         sanity.sanity()
         prep_stage.prep()
+        tts_stage.synthesize_chunks()
     return 0
 
 
