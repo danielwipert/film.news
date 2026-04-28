@@ -76,22 +76,23 @@ def _word_count(ssml: str) -> int:
 
 
 def _quiet_day_script(today_str: str, voice_name: str) -> str:
-    """Hand-written stub for the (rare) zero-summary day."""
+    """Hand-written stub for the (rare) zero-summary day.
+
+    Matches the SSML shape the writer prompt now produces — no
+    `<mstts:express-as>` wrapper, since DragonHD voices reject it.
+    """
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<speak version="1.0"\n'
         '       xmlns="http://www.w3.org/2001/10/synthesis"\n'
-        '       xmlns:mstts="http://www.w3.org/2001/mstts"\n'
         '       xml:lang="en-US">\n'
         f'  <voice name="{voice_name}">\n'
-        '    <mstts:express-as style="newscast">\n'
-        f'      Good morning. This is your daily film news brief for {today_str}. '
-        '      <break time="300ms"/>'
-        '      It\'s a quiet day on the wires — nothing major from the studios '
+        f'    Good morning. This is your daily film news brief for {today_str}. '
+        '    <break time="300ms"/>'
+        '    It\'s a quiet day on the wires — nothing major from the studios '
         'or the festival circuit overnight. We\'ll be back tomorrow with a fuller report. '
-        '      <break time="500ms"/>'
-        '      That\'s your film news for today. We\'ll see you tomorrow.\n'
-        '    </mstts:express-as>\n'
+        '    <break time="500ms"/>'
+        '    That\'s your film news for today. We\'ll see you tomorrow.\n'
         '  </voice>\n'
         '</speak>\n'
     )

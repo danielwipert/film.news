@@ -91,15 +91,32 @@ def test_validate_ssml_rejects_wrong_root():
         prep.validate_ssml('<?xml version="1.0"?><other xmlns="x"/>')
 
 
-def test_validate_ssml_rejects_missing_mstts_namespace():
-    bad = (
+def test_validate_ssml_accepts_no_mstts_when_no_mstts_elements():
+    """DragonHD path: no express-as means we don't need the mstts namespace."""
+    ok = (
         '<?xml version="1.0"?>'
         '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-        '<voice name="x"/>'
+        '<voice name="en-US-Davis:DragonHDLatestNeural">Hello.</voice>'
         '</speak>'
     )
-    with pytest.raises(prep.SsmlError, match="mstts"):
-        prep.validate_ssml(bad)
+    root = prep.validate_ssml(ok)
+    assert root is not None
+
+
+def test_validate_ssml_rejects_mstts_element_without_namespace():
+    """An mstts:* element with no namespace declaration is malformed."""
+    bad = (
+        '<?xml version="1.0"?>'
+        '<speak version="1.0" '
+        'xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xmlns:mstts="http://www.w3.org/2001/mstts" '
+        'xml:lang="en-US">'
+        '<voice name="x"><mstts:express-as style="newscast">Hi.</mstts:express-as></voice>'
+        '</speak>'
+    )
+    # Sanity check: the well-formed mstts version validates.
+    root = prep.validate_ssml(bad)
+    assert root is not None
 
 
 def test_validate_ssml_rejects_missing_voice_name():
@@ -197,6 +214,49 @@ def test_chunk_ssml_handles_inline_emphasis_inside_segment():
     assert len(chunks) == 1
     assert "<emphasis" in chunks[0]
     prep.validate_ssml(chunks[0])
+
+
+def _wrap_no_style(body: str, voice: str = "en-US-Davis:DragonHDLatestNeural") -> str:
+    """Wrap body in a <speak><voice>...</voice></speak> with no express-as.
+    This is the shape DragonHD voices require — express-as is rejected."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<speak version="1.0" '
+        'xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xml:lang="en-US">\n'
+        f'  <voice name="{voice}">\n'
+        f'    {body}\n'
+        '  </voice>\n'
+        '</speak>'
+    )
+
+
+def test_chunk_ssml_handles_no_express_as():
+    """DragonHD path: SSML with no <mstts:express-as> chunks fine and the
+    chunks themselves come back without an express-as wrapper."""
+    body = (
+        "Story one.<break time='500ms'/>"
+        "Story two.<break time='500ms'/>"
+        "Story three."
+    )
+    chunks = prep.chunk_ssml(_wrap_no_style(body), target_chars=10)
+    assert len(chunks) >= 2
+    for c in chunks:
+        root = etree.fromstring(c.encode("utf-8"))
+        # Voice present, but NO express-as wrapper.
+        voice = root.find(prep._qn("voice"))
+        assert voice is not None
+        assert voice.find(prep._qn("express-as", MSTTS_NS)) is None
+        prep.validate_ssml(c)
+
+
+def test_chunk_ssml_no_style_chunks_omit_mstts_namespace():
+    """Cleanliness: chunks built without express-as shouldn't declare an
+    unused mstts namespace."""
+    body = "One.<break time='500ms'/>Two."
+    chunks = prep.chunk_ssml(_wrap_no_style(body), target_chars=2)
+    for c in chunks:
+        assert "xmlns:mstts" not in c
 
 
 def test_chunk_ssml_does_not_duplicate_text_around_short_breaks():

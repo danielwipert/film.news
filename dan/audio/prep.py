@@ -90,8 +90,6 @@ def validate_ssml(ssml: str) -> etree._Element:
     ns_uris = set(root.nsmap.values())
     if SSML_NS not in ns_uris:
         raise SsmlError(f"missing SSML namespace ({SSML_NS})")
-    if MSTTS_NS not in ns_uris:
-        raise SsmlError(f"missing mstts namespace ({MSTTS_NS})")
 
     if root.get(_qn("lang", XML_NS)) != "en-US":
         raise SsmlError("missing or wrong xml:lang on <speak> (expected en-US)")
@@ -101,6 +99,15 @@ def validate_ssml(ssml: str) -> etree._Element:
         raise SsmlError(f"expected exactly one <voice>, found {len(voices)}")
     if not voices[0].get("name"):
         raise SsmlError("<voice> missing name attribute")
+
+    # The mstts namespace is only required if the document actually uses it
+    # (e.g. <mstts:express-as>). DragonHD voices skip express-as entirely
+    # and have no reason to declare mstts.
+    has_mstts_element = any(
+        el.tag.startswith(f"{{{MSTTS_NS}}}") for el in root.iter()
+    )
+    if has_mstts_element and MSTTS_NS not in ns_uris:
+        raise SsmlError(f"missing mstts namespace ({MSTTS_NS}) but <mstts:*> elements present")
 
     return root
 
@@ -194,19 +201,32 @@ def _group_into_chunks(segments: list[str], target_chars: int = TARGET_CHUNK_CHA
     return chunks
 
 
-def _build_chunk_doc(segments: list[str], voice_name: str, style: str) -> str:
-    """Wrap a list of segment inner-XML strings into a complete <speak> document."""
+def _build_chunk_doc(segments: list[str], voice_name: str, style: str | None) -> str:
+    """Wrap a list of segment inner-XML strings into a complete <speak> document.
+
+    When `style` is None the chunk has no `<mstts:express-as>` wrapper and the
+    body sits directly inside `<voice>` — required for DragonHD voices, which
+    silently fall back to neutral if express-as is present.
+    """
     body = '\n      <break time="500ms"/>\n      '.join(segments)
+    if style is not None:
+        inner = (
+            f'    <mstts:express-as style="{style}">\n'
+            f'      {body}\n'
+            f'    </mstts:express-as>\n'
+        )
+        ns_decl = '\n       xmlns:mstts="http://www.w3.org/2001/mstts"'
+    else:
+        inner = f'    {body}\n'
+        ns_decl = ""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<speak version="1.0"\n'
-        '       xmlns="http://www.w3.org/2001/10/synthesis"\n'
-        '       xmlns:mstts="http://www.w3.org/2001/mstts"\n'
+        '       xmlns="http://www.w3.org/2001/10/synthesis"'
+        f'{ns_decl}\n'
         '       xml:lang="en-US">\n'
         f'  <voice name="{voice_name}">\n'
-        f'    <mstts:express-as style="{style}">\n'
-        f'      {body}\n'
-        '    </mstts:express-as>\n'
+        f'{inner}'
         '  </voice>\n'
         '</speak>'
     )
@@ -220,9 +240,11 @@ def chunk_ssml(
 ) -> list[str]:
     """Split a validated SSML doc into one or more <speak> chunks.
 
-    Splits only at long-break boundaries inside the <mstts:express-as>
-    block; never inside an express-as. Each returned chunk is a complete,
-    independently valid SSML document.
+    Splits at long-break boundaries inside the body element — either
+    `<mstts:express-as>` (legacy / styled-voice path) or `<voice>` itself
+    (DragonHD path; HD voices reject express-as and infer prosody from
+    text). Each returned chunk is a complete, independently valid SSML
+    document that preserves the input's express-as wrapper iff present.
 
     If `voice_name` is given, it overrides the voice in the source SSML —
     Azure's TTS honors the SSML <voice> tag over any SDK-level config, so
@@ -232,13 +254,16 @@ def chunk_ssml(
     voice_el = root.find(_qn("voice"))
     chunk_voice = voice_name if voice_name is not None else voice_el.get("name", DEFAULT_VOICE)
     express_as = voice_el.find(_qn("express-as", MSTTS_NS))
-    if express_as is None:
-        raise SsmlError("no <mstts:express-as> element inside <voice>")
-    style = express_as.get("style", DEFAULT_STYLE)
+    if express_as is not None:
+        body_el = express_as
+        style = express_as.get("style", DEFAULT_STYLE)
+    else:
+        body_el = voice_el
+        style = None
 
-    segments = _split_segments(express_as)
+    segments = _split_segments(body_el)
     if not segments:
-        raise SsmlError("express-as body produced zero segments")
+        raise SsmlError("voice body produced zero segments")
 
     grouped = _group_into_chunks(segments, target_chars=target_chars)
     return [_build_chunk_doc(group, chunk_voice, style) for group in grouped]

@@ -1,4 +1,5 @@
 provider: azure
-voice: en-US-DavisNeural
-style: newscast
+voice: en-US-Davis:DragonHDLatestNeural
 output_format: Audio24Khz48KBitRateMonoMp3
+# style is intentionally omitted — DragonHD voices don't accept
+# <mstts:express-as style="..."> and infer prosody from text instead.

@@ -10,16 +10,18 @@ import sys
 
 from dotenv import load_dotenv
 
-from dan.audio import prep as prep_stage, tts as tts_stage
-from dan.llm import rank, sanity, summarize, write as write_stage
+from dan.audio import prep as prep_stage, stitch as stitch_stage, tts as tts_stage
+from dan.llm import describe as describe_stage, rank, sanity, summarize, write as write_stage
 from dan.paths import ROOT
+from dan.publish import upload as upload_stage
 from dan.sources import guardian
 
 # Auto-load .env for local dev. override=False so GitHub Actions secrets
 # (which arrive as real env vars) always win.
 load_dotenv(ROOT / ".env", override=False)
 
-STAGES = ("fetch", "rank", "summarize", "write", "sanity", "prep", "tts")
+STAGES = ("fetch", "rank", "summarize", "write", "sanity", "prep", "tts",
+          "stitch", "describe", "upload")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -61,6 +63,12 @@ def main(argv: list[str] | None = None) -> int:
         prep_stage.prep()
     elif args.only == "tts":
         tts_stage.synthesize_chunks()
+    elif args.only == "stitch":
+        stitch_stage.stitch()
+    elif args.only == "describe":
+        describe_stage.describe()
+    elif args.only == "upload":
+        upload_stage.upload()
     else:
         guardian.fetch(days_back=args.days_back)
         rank.rank()
@@ -69,6 +77,9 @@ def main(argv: list[str] | None = None) -> int:
         sanity.sanity()
         prep_stage.prep()
         tts_stage.synthesize_chunks()
+        stitch_stage.stitch()
+        describe_stage.describe()
+        upload_stage.upload()
     return 0
 
 
