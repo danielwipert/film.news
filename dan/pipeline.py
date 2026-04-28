@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from dan.audio import prep as prep_stage, stitch as stitch_stage, tts as tts_stage
 from dan.llm import describe as describe_stage, rank, sanity, summarize, write as write_stage
 from dan.paths import ROOT
-from dan.publish import upload as upload_stage
+from dan.publish import rss as rss_stage, upload as upload_stage
 from dan.sources import guardian
 
 # Auto-load .env for local dev. override=False so GitHub Actions secrets
@@ -21,7 +21,7 @@ from dan.sources import guardian
 load_dotenv(ROOT / ".env", override=False)
 
 STAGES = ("fetch", "rank", "summarize", "write", "sanity", "prep", "tts",
-          "stitch", "describe", "upload")
+          "stitch", "describe", "upload", "rss")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -69,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
         describe_stage.describe()
     elif args.only == "upload":
         upload_stage.upload()
+    elif args.only == "rss":
+        rss_stage.update_feed()
     else:
         guardian.fetch(days_back=args.days_back)
         rank.rank()
@@ -80,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         stitch_stage.stitch()
         describe_stage.describe()
         upload_stage.upload()
+        rss_stage.update_feed()
     return 0
 
 

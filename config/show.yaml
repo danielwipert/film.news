@@ -1,8 +1,8 @@
 # Show-level RSS metadata. Set once.
 title: "Daily Audio News - Film"
-description: ""
-author: ""
+description: "Daily news brief on Film News, sourced from The Guardian"
+author: "Daniel S. Wipert"
 language: "en-us"
-artwork_url: ""
+artwork_url: "https://pub-eef18dcf57db427292d293b10c7a6100.r2.dev/artwork/show-cover.jpg"
 category: "News"
 explicit: false
