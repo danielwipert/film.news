@@ -10,8 +10,13 @@
 
 rank:            google/gemini-2.5-flash-lite
 summarize:       google/gemini-2.5-flash-lite
-write_draft:     anthropic/claude-haiku-4.5
-write_critique:  anthropic/claude-haiku-4.5
+# Writer runs on Sonnet rather than Haiku because the listener actually
+# hears this stage. Haiku undershoots length targets (~700 spoken words
+# against a 1200-word prompt); Sonnet tracks the per-segment word counts
+# in the writer prompt reliably. ~5x cost on these two stages but the
+# absolute spend is still pennies per run.
+write_draft:     anthropic/claude-sonnet-4.6
+write_critique:  anthropic/claude-sonnet-4.6
 sanity_extract:  google/gemini-2.5-flash-lite
 sanity_verify:   google/gemini-2.5-flash-lite
 describe:        google/gemini-2.5-flash-lite

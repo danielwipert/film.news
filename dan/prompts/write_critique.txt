@@ -12,9 +12,17 @@ no "first... second... third," no exclamations.
 
 LENGTH TARGET
 =============
-1200 to 1800 words of spoken text (excluding SSML tags). If the draft is
-outside that range, fix it — tighten if too long, expand a story or two
-if too short, but never invent facts.
+8 to 10 minutes spoken — 1300 to 1500 words excluding SSML tags. If the
+draft is outside that range, fix it:
+  - Under 1200 words: expand. Add the texture that's already in the
+    summaries — supporting facts, names, quotes, context. Do not invent.
+    A draft that lands at 700-900 words is wrong; it has compressed away
+    material it was given. Restore it.
+  - Over 1600 words: tighten. Cut filler signposting, redundant
+    paraphrase, and sentences that don't carry a fact or transition.
+Per-segment guidance (matches the draft prompt): top story 250-300
+words; each secondary story 200-220; festival/international 200-220;
+roundup 200-250 total across 3-4 hits; review/lighter 200-220.
 
 WHAT YOU CHANGE
 ===============
