@@ -144,6 +144,7 @@ def _build_feed(show_cfg: dict[str, Any], entries: list[dict[str, Any]]) -> byte
     title = (show_cfg.get("title") or "").strip()
     description = (show_cfg.get("description") or "").strip()
     author = (show_cfg.get("author") or "").strip()
+    owner_email = (show_cfg.get("owner_email") or "").strip()
     artwork = (show_cfg.get("artwork_url") or "").strip()
     category = (show_cfg.get("category") or "News").strip()
     language = (show_cfg.get("language") or "en-us").strip()
@@ -151,7 +152,8 @@ def _build_feed(show_cfg: dict[str, Any], entries: list[dict[str, Any]]) -> byte
 
     missing = [name for name, val in
                (("title", title), ("description", description),
-                ("author", author), ("artwork_url", artwork))
+                ("author", author), ("owner_email", owner_email),
+                ("artwork_url", artwork))
                if not val]
     if missing:
         raise RSSError(f"show.yaml missing required field(s): {', '.join(missing)}")
@@ -170,6 +172,13 @@ def _build_feed(show_cfg: dict[str, Any], entries: list[dict[str, Any]]) -> byte
     fg.podcast.itunes_image(artwork)
     fg.podcast.itunes_category(category)
     fg.podcast.itunes_explicit(explicit)
+    # Apple Podcasts requires <itunes:owner> for submission (technical contact,
+    # not shown in the directory). Owner name reuses the author for a
+    # single-host show.
+    fg.podcast.itunes_owner(name=author, email=owner_email)
+    # itunes:type defaults to "episodic" if absent, but be explicit so Apple
+    # presents episodes newest-first rather than as a serialized arc.
+    fg.podcast.itunes_type("episodic")
 
     for e in entries:
         # order='append': we already sorted entries newest-first; without this

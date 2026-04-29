@@ -2,6 +2,9 @@
 title: "Daily Audio News - Film"
 description: "Daily news brief on Film News, sourced from The Guardian"
 author: "Daniel S. Wipert"
+# Apple Podcasts requires <itunes:owner><email> for submission. Apple uses
+# this address for technical contact only; it is NOT shown in the directory.
+owner_email: "wipertds@gmail.com"
 language: "en-us"
 artwork_url: "https://pub-eef18dcf57db427292d293b10c7a6100.r2.dev/artwork/show-cover.jpg"
 category: "News"

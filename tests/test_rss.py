@@ -249,6 +249,7 @@ def _show_cfg(**overrides):
         "title": "DAN — Film",
         "description": "Daily film news brief.",
         "author": "Daniel S. Wipert",
+        "owner_email": "owner@example.com",
         "language": "en-us",
         "artwork_url": "https://example.com/artwork.jpg",
         "category": "News",
@@ -344,12 +345,37 @@ def test_build_feed_with_zero_entries_is_valid_xml():
     assert root.find("channel/item") is None
 
 
-@pytest.mark.parametrize("missing_field", ["title", "description", "author", "artwork_url"])
+@pytest.mark.parametrize("missing_field",
+                         ["title", "description", "author", "owner_email", "artwork_url"])
 def test_build_feed_raises_on_missing_required_show_field(missing_field):
     cfg = _show_cfg()
     cfg[missing_field] = ""
     with pytest.raises(RSSError, match=missing_field):
         rss._build_feed(cfg, [])
+
+
+def test_build_feed_sets_itunes_owner_for_apple_submission():
+    """Apple Podcasts requires <itunes:owner> with a name and email for
+    submission. Without this Apple silently rejects the feed."""
+    xml = rss._build_feed(
+        _show_cfg(author="Jane Doe", owner_email="jane@example.com"),
+        [_entry()],
+    )
+    root = etree.fromstring(xml)
+    ns = {"itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd"}
+    owner = root.find("channel/itunes:owner", namespaces=ns)
+    assert owner is not None
+    assert owner.findtext("itunes:name", namespaces=ns) == "Jane Doe"
+    assert owner.findtext("itunes:email", namespaces=ns) == "jane@example.com"
+
+
+def test_build_feed_sets_itunes_type_episodic():
+    """itunes:type=episodic so Apple presents episodes newest-first rather
+    than as a serialized arc."""
+    xml = rss._build_feed(_show_cfg(), [_entry()])
+    root = etree.fromstring(xml)
+    ns = {"itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd"}
+    assert root.find("channel").findtext("itunes:type", namespaces=ns) == "episodic"
 
 
 # ---------- update_feed (orchestration) ----------
