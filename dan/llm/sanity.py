@@ -104,36 +104,48 @@ async def _verify_claim(
 ) -> dict[str, str]:
     """Call B (per claim) — return {text, status, evidence}.
 
-    Retries once if the verifier returns malformed JSON. A single bad
-    response otherwise becomes a false-positive "unsupported" verdict and
-    fails the whole pipeline due to LLM stochasticity, not a real issue
-    with the claim.
+    Re-asks the verifier once if the first verdict is non-supported. The
+    verifier is stochastic enough at T=0 that the same claim against the
+    same source can flip between supported and unsupported across calls
+    (observed: a "Michael 217m opening weekend" claim marked supported in
+    pass 1 came back unsupported in pass 2 of the same run). Malformed
+    JSON and unknown status values are also treated as non-supported and
+    trigger the same re-ask. If the second call says supported, accept
+    it; otherwise keep the first verdict so real hallucinations still
+    surface.
     """
     user = (
         f"Source key facts and summaries:\n{source_block}\n\n"
         f"Claim to verify:\n{claim}"
     )
-    data: dict[str, Any] | None = None
-    for attempt in (1, 2):
+
+    async def _ask() -> tuple[str, str]:
+        """One verify call. Returns (status, evidence). Status is
+        normalized — malformed JSON or unknown values become 'unsupported'."""
         text = await provider.complete(
             system=system, user=user, model=model,
             json_mode=True, temperature=VERIFY_TEMPERATURE,
         )
         try:
             data = json.loads(text)
-            break
         except json.JSONDecodeError:
-            if attempt == 1:
-                log.warning("verify: malformed JSON for claim %r — retrying", claim[:60])
-                continue
-            log.warning("verify: malformed JSON after retry for claim %r — defaulting unsupported", claim[:60])
-            return {"text": claim, "status": "unsupported", "evidence": "verifier returned malformed JSON after retry"}
-    assert data is not None  # loop either sets data or returns
-    status = data.get("status", "unsupported")
-    if status not in _VALID_STATUSES:
-        log.warning("verify: unknown status %r for claim %r — defaulting unsupported", status, claim[:60])
-        status = "unsupported"
-    evidence = str(data.get("evidence", "")).strip()
+            return ("unsupported", "verifier returned malformed JSON")
+        status = data.get("status", "unsupported")
+        if status not in _VALID_STATUSES:
+            status = "unsupported"
+        evidence = str(data.get("evidence", "")).strip()
+        return (status, evidence)
+
+    status, evidence = await _ask()
+    if status == "supported":
+        return {"text": claim, "status": status, "evidence": evidence}
+
+    log.info("verify: %s for claim %r — re-asking once", status, claim[:60])
+    retry_status, retry_evidence = await _ask()
+    if retry_status == "supported":
+        log.info("verify: retry says supported for claim %r", claim[:60])
+        return {"text": claim, "status": "supported", "evidence": retry_evidence}
+
     return {"text": claim, "status": status, "evidence": evidence}
 
 

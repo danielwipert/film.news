@@ -86,9 +86,22 @@ def test_verify_claim_happy_path():
 
 
 def test_verify_claim_unknown_status_falls_back_to_unsupported():
-    p = _provider(json.dumps({"status": "maybe", "evidence": "uncertain"}))
+    """Unknown status values get normalized to unsupported on each call,
+    so two unknown statuses in a row stay unsupported."""
+    p = _provider(
+        json.dumps({"status": "maybe", "evidence": "uncertain"}),
+        json.dumps({"status": "alsobogus", "evidence": "still uncertain"}),
+    )
     out = asyncio.run(sanity._verify_claim(p, "m", "sys", "c", "src"))
     assert out["status"] == "unsupported"
+
+
+def test_verify_claim_supported_does_not_retry():
+    """First-call supported verdict short-circuits — no retry call."""
+    p = _provider(json.dumps({"status": "supported", "evidence": "ok"}))
+    out = asyncio.run(sanity._verify_claim(p, "m", "sys", "c", "src"))
+    assert out["status"] == "supported"
+    assert p.complete.await_count == 1
 
 
 def test_verify_claim_malformed_json_falls_back_to_unsupported_after_retry():
@@ -101,11 +114,38 @@ def test_verify_claim_malformed_json_falls_back_to_unsupported_after_retry():
 
 
 def test_verify_claim_retries_on_malformed_json():
-    """One malformed response then a valid one → uses the valid one."""
+    """Malformed first response, valid supported on retry → use the retry."""
     p = _provider("not json", json.dumps({"status": "supported", "evidence": "ok"}))
     out = asyncio.run(sanity._verify_claim(p, "m", "sys", "c", "src"))
     assert out["status"] == "supported"
     assert out["evidence"] == "ok"
+    assert p.complete.await_count == 2
+
+
+def test_verify_claim_retries_on_unsupported_and_accepts_supported_retry():
+    """Verifier stochasticity: first call says unsupported, retry says
+    supported. Accept the retry — otherwise we'd fail the pipeline on
+    flip-flopping verdicts."""
+    p = _provider(
+        json.dumps({"status": "unsupported", "evidence": "no"}),
+        json.dumps({"status": "supported", "evidence": "yes after all"}),
+    )
+    out = asyncio.run(sanity._verify_claim(p, "m", "sys", "c", "src"))
+    assert out["status"] == "supported"
+    assert out["evidence"] == "yes after all"
+    assert p.complete.await_count == 2
+
+
+def test_verify_claim_keeps_first_verdict_when_retry_also_negative():
+    """Two non-supported verdicts in a row → keep the first verdict so
+    real hallucinations still surface to the rewrite path."""
+    p = _provider(
+        json.dumps({"status": "unsupported", "evidence": "first reason"}),
+        json.dumps({"status": "partial", "evidence": "still negative"}),
+    )
+    out = asyncio.run(sanity._verify_claim(p, "m", "sys", "c", "src"))
+    assert out["status"] == "unsupported"
+    assert out["evidence"] == "first reason"
     assert p.complete.await_count == 2
 
 
@@ -170,6 +210,8 @@ def test_sanity_rewrites_then_passes_on_second_attempt(monkeypatch, tmp_path):
         # Pass 1: verify
         json.dumps({"status": "supported", "evidence": "ok"}),
         json.dumps({"status": "unsupported", "evidence": "not in source"}),
+        # Pass 1: retry on the unsupported claim — still unsupported
+        json.dumps({"status": "unsupported", "evidence": "still not in source"}),
         # Rewrite (Stage 4 critique)
         revised_script,
         # Pass 2: extract
@@ -200,11 +242,15 @@ def test_sanity_raises_when_rewrite_still_fails(monkeypatch, tmp_path):
         # Pass 1
         json.dumps({"claims": ["claim 1"]}),
         json.dumps({"status": "unsupported", "evidence": "no"}),
+        # Pass 1 retry — still unsupported
+        json.dumps({"status": "unsupported", "evidence": "still no"}),
         # Rewrite
         "<speak>revised but still broken</speak>",
         # Pass 2
         json.dumps({"claims": ["claim 1"]}),
         json.dumps({"status": "unsupported", "evidence": "still no"}),
+        # Pass 2 retry — still unsupported
+        json.dumps({"status": "unsupported", "evidence": "still no after retry"}),
     ])
 
     with pytest.raises(SanityError, match="1 unsupported"):
@@ -227,6 +273,8 @@ def test_sanity_partial_status_is_treated_as_failure(monkeypatch, tmp_path):
     fake.complete = AsyncMock(side_effect=[
         json.dumps({"claims": ["one fact"]}),
         json.dumps({"status": "partial", "evidence": "added a detail"}),
+        # Retry — still partial, so the failure verdict survives
+        json.dumps({"status": "partial", "evidence": "still partial"}),
         # Rewrite
         "<speak>tightened</speak>",
         # Pass 2
