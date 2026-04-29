@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -241,6 +242,194 @@ def test_rank_handles_zero_articles(monkeypatch, tmp_path):
     data = json.loads(out_path.read_text(encoding="utf-8"))
     assert data["meta"]["output_count"] == 0
     assert data["selected"] == []
+
+
+# ---------- cross-episode dedup ----------
+
+def _date_keyed_log_dir(tmp_path):
+    """log_dir mock that maps each date to its own subdir so prior-day reads
+    work in tests."""
+    def _impl(d=None):
+        if d is None:
+            d = date(2026, 4, 29)
+        p = tmp_path / d.isoformat()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return _impl
+
+
+def _write_ranked(day_dir: Path, ids: list[str]) -> None:
+    day_dir.mkdir(parents=True, exist_ok=True)
+    (day_dir / "02_ranked.json").write_text(
+        json.dumps({"selected": [{"id": i} for i in ids]}), encoding="utf-8",
+    )
+
+
+def test_load_recent_aired_ids_aggregates_across_lookback_window(
+    monkeypatch, tmp_path,
+):
+    """Reads 02_ranked.json from each of the last `lookback_days` and unions
+    the selected ids."""
+    monkeypatch.setattr(rank, "log_dir", _date_keyed_log_dir(tmp_path))
+    today = date(2026, 4, 29)
+    _write_ranked(tmp_path / "2026-04-28", ["a", "b"])
+    _write_ranked(tmp_path / "2026-04-27", ["c"])
+    _write_ranked(tmp_path / "2026-04-26", ["d", "e"])
+
+    aired = rank._load_recent_aired_ids(today, lookback_days=3)
+    assert aired == {"a", "b", "c", "d", "e"}
+
+
+def test_load_recent_aired_ids_respects_lookback_horizon(monkeypatch, tmp_path):
+    """Days outside the lookback window are not consulted, even if they exist."""
+    monkeypatch.setattr(rank, "log_dir", _date_keyed_log_dir(tmp_path))
+    today = date(2026, 4, 29)
+    _write_ranked(tmp_path / "2026-04-28", ["recent"])
+    _write_ranked(tmp_path / "2026-04-20", ["ancient"])
+
+    aired = rank._load_recent_aired_ids(today, lookback_days=3)
+    assert aired == {"recent"}
+    assert "ancient" not in aired
+
+
+def test_load_recent_aired_ids_skips_missing_directories(monkeypatch, tmp_path):
+    """Early days of the show have no prior episodes — return what we find."""
+    monkeypatch.setattr(rank, "log_dir", _date_keyed_log_dir(tmp_path))
+    today = date(2026, 4, 29)
+    _write_ranked(tmp_path / "2026-04-28", ["only"])
+    # No directory for 2026-04-27 or 2026-04-26.
+
+    aired = rank._load_recent_aired_ids(today, lookback_days=3)
+    assert aired == {"only"}
+
+
+def test_load_recent_aired_ids_skips_corrupt_json(monkeypatch, tmp_path, caplog):
+    """An unreadable prior file logs a warning but doesn't break the run."""
+    monkeypatch.setattr(rank, "log_dir", _date_keyed_log_dir(tmp_path))
+    today = date(2026, 4, 29)
+    bad = tmp_path / "2026-04-28"
+    bad.mkdir(parents=True)
+    (bad / "02_ranked.json").write_text("{not json", encoding="utf-8")
+
+    aired = rank._load_recent_aired_ids(today, lookback_days=3)
+    assert aired == set()
+
+
+def test_filter_recently_aired_drops_aired_articles():
+    articles = [{"id": str(i)} for i in range(10)]
+    out = rank._filter_recently_aired(articles, {"3", "7"})
+    assert [a["id"] for a in out] == ["0", "1", "2", "4", "5", "6", "8", "9"]
+
+
+def test_filter_recently_aired_returns_input_when_aired_empty():
+    articles = [{"id": "a"}]
+    out = rank._filter_recently_aired(articles, set())
+    assert out is articles
+
+
+def test_filter_recently_aired_skips_when_pool_would_drop_below_min():
+    """Quiet day: if dedup would leave fewer than MIN_FINAL_COUNT articles,
+    accept some repetition rather than ship a thin brief."""
+    articles = [{"id": str(i)} for i in range(7)]
+    aired = {"0", "1", "2", "3"}  # would leave 3, below MIN_FINAL_COUNT=6
+    out = rank._filter_recently_aired(articles, aired)
+    assert out == articles
+
+
+def test_filter_recently_aired_applies_when_pool_stays_at_min():
+    """Boundary: dedup is applied when the post-dedup pool is exactly
+    MIN_FINAL_COUNT."""
+    articles = [{"id": str(i)} for i in range(8)]
+    aired = {"0", "1"}  # leaves 6, equal to MIN_FINAL_COUNT
+    out = rank._filter_recently_aired(articles, aired)
+    assert [a["id"] for a in out] == ["2", "3", "4", "5", "6", "7"]
+
+
+def test_rank_filters_articles_aired_in_prior_episode(monkeypatch, tmp_path):
+    """End-to-end: rank() reads prior days' 02_ranked.json and excludes
+    articles already used."""
+    monkeypatch.setattr(rank, "log_dir", _date_keyed_log_dir(tmp_path))
+    monkeypatch.setattr(rank, "today_utc", lambda: date(2026, 4, 29))
+    monkeypatch.setattr(rank.config, "models", lambda: {"rank": "test/model"})
+
+    # Yesterday: an article was already aired.
+    _write_ranked(tmp_path / "2026-04-28", ["film/repeat"])
+
+    # Today's pool: the repeat plus 7 fresh articles.
+    today_dir = tmp_path / "2026-04-29"
+    today_dir.mkdir(parents=True, exist_ok=True)
+    articles = [
+        {"id": "film/repeat", "title": "Repeat headline alpha beta gamma delta",
+         "trail": "t", "byline": "B", "wordcount": 200,
+         "published_at": "2026-04-28T08:00:00Z", "url": "u", "body": "body " * 100},
+    ] + [
+        {"id": f"film/fresh{i}",
+         "title": f"Fresh headline epsilon{i} zeta eta theta iota",
+         "trail": "t", "byline": "B", "wordcount": 200,
+         "published_at": "2026-04-29T08:00:00Z", "url": "u", "body": "body " * 100}
+        for i in range(7)
+    ]
+    (today_dir / "01_raw_articles.json").write_text(
+        json.dumps({"meta": {}, "articles": articles}), encoding="utf-8",
+    )
+
+    async def _fake_complete(**kwargs):
+        return json.dumps({
+            "newsworthiness": 5, "audibility": 4, "freshness": 5,
+            "category": "news", "rationale": "x",
+        })
+    fake_provider = MagicMock()
+    fake_provider.complete = AsyncMock(side_effect=_fake_complete)
+
+    out_path = rank.rank(provider=fake_provider)
+    data = json.loads(out_path.read_text(encoding="utf-8"))
+
+    selected_ids = [s["id"] for s in data["selected"]]
+    assert "film/repeat" not in selected_ids
+    # input_count reflects the post-dedup pool fed to the LLM.
+    assert data["meta"]["input_count"] == 7
+    # The LLM was only called for the 7 surviving articles, not the 8 raw.
+    assert fake_provider.complete.await_count == 7
+
+
+def test_rank_skips_dedup_on_quiet_day(monkeypatch, tmp_path):
+    """If applying dedup would shrink the pool below MIN_FINAL_COUNT, the
+    repeat is kept and the LLM scores all articles including the repeat."""
+    monkeypatch.setattr(rank, "log_dir", _date_keyed_log_dir(tmp_path))
+    monkeypatch.setattr(rank, "today_utc", lambda: date(2026, 4, 29))
+    monkeypatch.setattr(rank.config, "models", lambda: {"rank": "test/model"})
+
+    # Yesterday: 4 articles aired.
+    _write_ranked(tmp_path / "2026-04-28",
+                  ["film/a", "film/b", "film/c", "film/d"])
+
+    # Today: only 7 articles, 4 of which were already aired. Dedup would
+    # leave 3 — below MIN_FINAL_COUNT — so dedup must be skipped.
+    today_dir = tmp_path / "2026-04-29"
+    today_dir.mkdir(parents=True, exist_ok=True)
+    repeat_ids = ["film/a", "film/b", "film/c", "film/d"]
+    fresh_ids = ["film/e", "film/f", "film/g"]
+    articles = [
+        {"id": i, "title": f"Headline {i} alpha beta gamma delta",
+         "trail": "t", "byline": "B", "wordcount": 200,
+         "published_at": "x", "url": "u", "body": "body " * 100}
+        for i in repeat_ids + fresh_ids
+    ]
+    (today_dir / "01_raw_articles.json").write_text(
+        json.dumps({"meta": {}, "articles": articles}), encoding="utf-8",
+    )
+
+    async def _fake_complete(**kwargs):
+        return json.dumps({
+            "newsworthiness": 5, "audibility": 4, "freshness": 5,
+            "category": "news", "rationale": "x",
+        })
+    fake_provider = MagicMock()
+    fake_provider.complete = AsyncMock(side_effect=_fake_complete)
+
+    rank.rank(provider=fake_provider)
+    # All 7 articles scored — dedup was skipped because the pool was too thin.
+    assert fake_provider.complete.await_count == 7
 
 
 def test_rank_end_to_end_with_mocked_provider(monkeypatch, tmp_path):

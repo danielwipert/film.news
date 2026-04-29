@@ -11,7 +11,7 @@ import json
 import logging
 import re
 from collections import Counter, defaultdict
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,7 @@ SAME_FILM_LIMIT = 3         # §5.2.2: 3+ about the same film triggers prune
 MIN_FINAL_COUNT = 6         # §5.2.2: final list 6-10 items
 MAX_FINAL_COUNT = 10
 VARIETY_FALLBACK_THRESHOLD = 5  # §5.5: <5 surviving variety -> fall back to top-N
+DEDUP_LOOKBACK_DAYS = 3     # exclude articles selected in the last N days' episodes
 
 PROMPT_PATH = ROOT / "dan" / "prompts" / "rank_score.txt"
 
@@ -318,6 +319,59 @@ def _ensure_non_news(
     return new_candidates
 
 
+# ---------- cross-episode dedup ----------
+
+def _load_recent_aired_ids(
+    d: date, lookback_days: int = DEDUP_LOOKBACK_DAYS,
+) -> set[str]:
+    """Collect article ids selected in the prior `lookback_days` 02_ranked.json
+    files. Missing day directories or unreadable JSON are skipped silently —
+    early days of the show simply have nothing to dedup against."""
+    aired: set[str] = set()
+    for k in range(1, lookback_days + 1):
+        prior_dir = log_dir(d - timedelta(days=k))
+        ranked_path = prior_dir / "02_ranked.json"
+        if not ranked_path.exists():
+            continue
+        try:
+            data = read_json(ranked_path)
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("dedup: could not read %s: %s", ranked_path, e)
+            continue
+        for sel in (data.get("selected") or []):
+            sid = sel.get("id")
+            if sid:
+                aired.add(sid)
+    return aired
+
+
+def _filter_recently_aired(
+    articles: list[dict[str, Any]], aired: set[str],
+) -> list[dict[str, Any]]:
+    """Drop articles whose id was selected in a prior episode within the lookback
+    window. Skipped entirely if applying it would leave fewer than
+    MIN_FINAL_COUNT articles — on a quiet day we'd rather accept some
+    repetition than ship a thin brief."""
+    if not aired:
+        return articles
+    deduped = [a for a in articles if a.get("id") not in aired]
+    dropped = len(articles) - len(deduped)
+    if dropped == 0:
+        return articles
+    if len(deduped) < MIN_FINAL_COUNT:
+        log.warning(
+            "dedup: %d previously-aired article(s) found, but applying the "
+            "filter would leave %d in the pool (min %d) — skipping for this run",
+            dropped, len(deduped), MIN_FINAL_COUNT,
+        )
+        return articles
+    log.info(
+        "dedup: dropped %d previously-aired article(s) (%d-day lookback)",
+        dropped, DEDUP_LOOKBACK_DAYS,
+    )
+    return deduped
+
+
 # ---------- pipeline entry ----------
 
 def _format_selected(selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -360,6 +414,10 @@ def rank(d: date | None = None, *, provider: OpenRouterProvider | None = None) -
 
     raw = read_json(day_dir / "01_raw_articles.json")
     articles = raw.get("articles") or []
+
+    # Cross-episode dedup: drop articles already aired in the last few days.
+    aired = _load_recent_aired_ids(d)
+    articles = _filter_recently_aired(articles, aired)
 
     if not articles:
         log.warning("rank: zero articles in 01_raw_articles.json; emitting empty selection")
