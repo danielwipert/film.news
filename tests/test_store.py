@@ -207,3 +207,87 @@ def test_exists_raises_on_botocore_error():
     s = _store(client=client)
     with pytest.raises(ObjectStoreError, match="head 'k' failed"):
         s.exists("k")
+
+
+# ---------- list_prefix ----------
+
+def test_list_prefix_returns_object_keys():
+    client = MagicMock()
+    client.list_objects_v2.return_value = {
+        "Contents": [{"Key": "episodes/2026/04/a.mp3"},
+                     {"Key": "episodes/2026/04/b.mp3"}],
+    }
+    s = _store(client=client)
+    assert s.list_prefix("episodes/") == [
+        "episodes/2026/04/a.mp3",
+        "episodes/2026/04/b.mp3",
+    ]
+    client.list_objects_v2.assert_called_once_with(
+        Bucket="dan-podcast", Prefix="episodes/",
+    )
+
+
+def test_list_prefix_empty_when_no_contents_key():
+    client = MagicMock()
+    client.list_objects_v2.return_value = {}
+    s = _store(client=client)
+    assert s.list_prefix("episodes/") == []
+
+
+def test_list_prefix_empty_when_contents_is_none():
+    client = MagicMock()
+    client.list_objects_v2.return_value = {"Contents": None}
+    s = _store(client=client)
+    assert s.list_prefix("episodes/") == []
+
+
+def test_list_prefix_skips_entries_without_key():
+    client = MagicMock()
+    client.list_objects_v2.return_value = {
+        "Contents": [{"Key": "a"}, {"Size": 0}, {"Key": "b"}],
+    }
+    s = _store(client=client)
+    assert s.list_prefix("p") == ["a", "b"]
+
+
+def test_list_prefix_wraps_client_error():
+    client = MagicMock()
+    client.list_objects_v2.side_effect = _client_error("AccessDenied", "ListObjectsV2")
+    s = _store(client=client)
+    with pytest.raises(ObjectStoreError, match="list_prefix 'episodes/' failed"):
+        s.list_prefix("episodes/")
+
+
+def test_list_prefix_wraps_botocore_error():
+    client = MagicMock()
+    client.list_objects_v2.side_effect = EndpointConnectionError(endpoint_url="https://x")
+    s = _store(client=client)
+    with pytest.raises(ObjectStoreError, match="list_prefix"):
+        s.list_prefix("p")
+
+
+# ---------- delete ----------
+
+def test_delete_calls_delete_object():
+    client = MagicMock()
+    s = _store(client=client)
+    s.delete("episodes/2026/04/old.mp3")
+    client.delete_object.assert_called_once_with(
+        Bucket="dan-podcast", Key="episodes/2026/04/old.mp3",
+    )
+
+
+def test_delete_wraps_client_error():
+    client = MagicMock()
+    client.delete_object.side_effect = _client_error("AccessDenied", "DeleteObject")
+    s = _store(client=client)
+    with pytest.raises(ObjectStoreError, match="delete 'k' failed"):
+        s.delete("k")
+
+
+def test_delete_wraps_botocore_error():
+    client = MagicMock()
+    client.delete_object.side_effect = EndpointConnectionError(endpoint_url="https://x")
+    s = _store(client=client)
+    with pytest.raises(ObjectStoreError, match="delete"):
+        s.delete("k")

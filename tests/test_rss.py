@@ -354,10 +354,12 @@ def test_build_feed_raises_on_missing_required_show_field(missing_field):
 
 # ---------- update_feed (orchestration) ----------
 
-def _fake_store(prior: bytes | None = None) -> MagicMock:
+def _fake_store(prior: bytes | None = None,
+                listing: list[str] | None = None) -> MagicMock:
     s = MagicMock()
     s.name = "fake:test"
     s.get.return_value = prior
+    s.list_prefix.return_value = list(listing or [])
     return s
 
 
@@ -439,14 +441,15 @@ def test_update_feed_dedupes_same_date_rerun(monkeypatch, tmp_path):
     assert today_enclosures[0].get("length") == "11111"
 
 
-def test_update_feed_caps_at_50_items(monkeypatch, tmp_path):
+def test_update_feed_caps_at_retention_count(monkeypatch, tmp_path):
     _patch_today(monkeypatch, tmp_path, d=date(2026, 4, 27))
     _seed_today(tmp_path)
 
-    # Build a synthetic prior with 60 entries from 2026-01-01 onward.
+    # Build a synthetic prior with 30 entries from 2026-03-28 onward — after
+    # appending today (04-27) the feed must cap at RETENTION_COUNT.
     items_xml = []
-    for i in range(60):
-        day = date(2026, 1, 1).toordinal() + i
+    for i in range(30):
+        day = date(2026, 3, 28).toordinal() + i
         ds = date.fromordinal(day).isoformat()
         items_xml.append(f"""
         <item>
@@ -467,9 +470,144 @@ def test_update_feed_caps_at_50_items(monkeypatch, tmp_path):
     args, _ = store.put.call_args
     root = etree.fromstring(args[1])
     items = root.findall("channel/item")
-    assert len(items) == 50
+    assert len(items) == rss.RETENTION_COUNT
     # Newest first — today's entry is on top.
     assert items[0].findtext("title") == "DAN Film Brief — 2026-04-27"
+
+
+# ---------- retention / orphan prune ----------
+
+def test_kept_episode_keys_derives_from_pubdates():
+    entries = [
+        _entry(d=date(2026, 4, 27)),
+        _entry(d=date(2026, 4, 26)),
+    ]
+    keys = rss._kept_episode_keys(entries)
+    assert keys == {
+        "episodes/2026/04/dan-film-2026-04-27.mp3",
+        "episodes/2026/04/dan-film-2026-04-26.mp3",
+    }
+
+
+def test_kept_episode_keys_handles_date_pubdate():
+    """pubDate is normally a datetime; tolerate a bare date too."""
+    entries = [{"pubDate": date(2026, 1, 5)}]
+    assert rss._kept_episode_keys(entries) == {
+        "episodes/2026/01/dan-film-2026-01-05.mp3",
+    }
+
+
+def test_kept_episode_keys_skips_entries_without_pubdate():
+    assert rss._kept_episode_keys([{"pubDate": None}, {}]) == set()
+
+
+def test_prune_orphan_episodes_deletes_only_unkept():
+    store = _fake_store(listing=[
+        "episodes/2026/04/keep1.mp3",
+        "episodes/2026/04/orphan1.mp3",
+        "episodes/2026/04/keep2.mp3",
+        "episodes/2026/04/orphan2.mp3",
+    ])
+    keep = {"episodes/2026/04/keep1.mp3", "episodes/2026/04/keep2.mp3"}
+
+    deleted = rss._prune_orphan_episodes(store, keep)
+
+    assert deleted == 2
+    deleted_calls = sorted(c.args[0] for c in store.delete.call_args_list)
+    assert deleted_calls == [
+        "episodes/2026/04/orphan1.mp3",
+        "episodes/2026/04/orphan2.mp3",
+    ]
+
+
+def test_prune_orphan_episodes_returns_zero_when_listing_fails():
+    """list_prefix failure logs a warning but doesn't raise — retention is a
+    storage-cost concern, the feed has already been published."""
+    from dan.publish.store import ObjectStoreError
+    store = _fake_store()
+    store.list_prefix.side_effect = ObjectStoreError("denied")
+    assert rss._prune_orphan_episodes(store, {"k"}) == 0
+    store.delete.assert_not_called()
+
+
+def test_prune_orphan_episodes_continues_on_individual_delete_failure():
+    """A failing delete on one key shouldn't stop the others — the next
+    key may still be deletable, and orphans we miss get retried next run."""
+    from dan.publish.store import ObjectStoreError
+    store = _fake_store(listing=["a", "b", "c"])
+    store.delete.side_effect = [None, ObjectStoreError("nope"), None]
+    deleted = rss._prune_orphan_episodes(store, set())
+    assert deleted == 2
+    assert store.delete.call_count == 3
+
+
+def test_prune_orphan_episodes_returns_zero_when_all_kept():
+    store = _fake_store(listing=["a", "b"])
+    assert rss._prune_orphan_episodes(store, {"a", "b"}) == 0
+    store.delete.assert_not_called()
+
+
+def test_update_feed_prunes_orphans_in_lockstep_with_feed_cap(monkeypatch, tmp_path):
+    """End-to-end: feed.xml caps at RETENTION_COUNT; R2 keys not in the
+    surviving 7 entries are deleted so the feed never points at a 404."""
+    _patch_today(monkeypatch, tmp_path, d=date(2026, 4, 27))
+    _seed_today(tmp_path)
+
+    # Prior: 10 episodes (04-17 .. 04-26). Today (04-27) is added → 11 entries
+    # before cap, 7 after. The 4 oldest (04-17..04-20) become orphans.
+    items_xml = []
+    bucket_keys = []
+    for i in range(10):
+        d = date(2026, 4, 17 + i)
+        ds = d.isoformat()
+        url = f"https://pub-x.r2.dev/episodes/2026/04/dan-film-{ds}.mp3"
+        bucket_keys.append(f"episodes/2026/04/dan-film-{ds}.mp3")
+        items_xml.append(f"""
+        <item>
+          <title>old {ds}</title>
+          <description>x</description>
+          <pubDate>{rss._episode_pubdate(d).strftime('%a, %d %b %Y %H:%M:%S +0000')}</pubDate>
+          <guid isPermaLink="false">{url}</guid>
+          <enclosure url="{url}" length="1" type="audio/mpeg"/>
+        </item>""")
+    prior = (b'<?xml version="1.0"?><rss version="2.0" '
+             b'xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"><channel>'
+             + "".join(items_xml).encode("utf-8")
+             + b"</channel></rss>")
+    bucket_keys.append("episodes/2026/04/dan-film-2026-04-27.mp3")
+
+    store = _fake_store(prior=prior, listing=bucket_keys)
+    rss.update_feed(store=store)
+
+    # Feed: capped to 7, newest first.
+    feed_args, _ = store.put.call_args
+    root = etree.fromstring(feed_args[1])
+    items = root.findall("channel/item")
+    assert len(items) == 7
+    assert items[0].findtext("title") == "DAN Film Brief — 2026-04-27"
+
+    # Storage: the four oldest got pruned.
+    deleted_keys = sorted(c.args[0] for c in store.delete.call_args_list)
+    assert deleted_keys == [
+        "episodes/2026/04/dan-film-2026-04-17.mp3",
+        "episodes/2026/04/dan-film-2026-04-18.mp3",
+        "episodes/2026/04/dan-film-2026-04-19.mp3",
+        "episodes/2026/04/dan-film-2026-04-20.mp3",
+    ]
+
+
+def test_update_feed_does_not_prune_when_storage_listing_fails(monkeypatch, tmp_path):
+    """A failing list_prefix doesn't crash the run — feed.xml is already
+    published; retention is best-effort."""
+    from dan.publish.store import ObjectStoreError
+    _patch_today(monkeypatch, tmp_path, d=date(2026, 4, 27))
+    _seed_today(tmp_path)
+    store = _fake_store(prior=None)
+    store.list_prefix.side_effect = ObjectStoreError("denied")
+
+    rss.update_feed(store=store)  # must not raise
+
+    store.delete.assert_not_called()
 
 
 def test_update_feed_raises_when_today_inputs_missing(monkeypatch, tmp_path):

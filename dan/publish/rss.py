@@ -26,13 +26,18 @@ from dan.config import show as load_show
 from dan.io import read_json
 from dan.paths import log_dir, today_utc
 from dan.publish.store import ObjectStore, ObjectStoreError, R2ObjectStore
+from dan.publish.upload import episode_key
 
 log = logging.getLogger(__name__)
 
 FEED_KEY = "feed.xml"
 FEED_CONTENT_TYPE = "application/rss+xml"
 ENCLOSURE_TYPE = "audio/mpeg"
-MAX_ITEMS = 50
+EPISODE_PREFIX = "episodes/"
+# Rolling retention. The feed cap and the storage prune are the SAME number —
+# they must move together, otherwise the feed points at deleted MP3s and Apple
+# Podcasts / Spotify will show 404s for old episodes.
+RETENTION_COUNT = 7
 
 # iTunes namespace used to read prior <itunes:duration> when re-parsing feed.xml.
 NS = {"itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd"}
@@ -182,6 +187,47 @@ def _build_feed(show_cfg: dict[str, Any], entries: list[dict[str, Any]]) -> byte
     return fg.rss_str(pretty=True)
 
 
+def _kept_episode_keys(entries: list[dict[str, Any]]) -> set[str]:
+    """Storage keys that must remain in R2 — derived from feed entries' pubDates.
+
+    Each entry's pubDate gives us the episode date; episode_key() gives the
+    canonical storage key for that date (spec §12.2). We don't parse the
+    enclosure URL because the URL format depends on the public base, while the
+    key format is stable across backends."""
+    keys: set[str] = set()
+    for e in entries:
+        pub = e.get("pubDate")
+        if pub is None:
+            continue
+        d = pub.date() if hasattr(pub, "date") else pub
+        keys.add(episode_key(d))
+    return keys
+
+
+def _prune_orphan_episodes(store: ObjectStore, keep_keys: set[str]) -> int:
+    """Delete MP3s under EPISODE_PREFIX that aren't referenced by the feed.
+
+    Soft-fails: a single delete error is logged but doesn't abort the run —
+    orphan storage gets retried next run. Failure to list the prefix at all
+    is also non-fatal: the feed has already been published, retention is a
+    storage-cost concern not a correctness one."""
+    try:
+        all_keys = store.list_prefix(EPISODE_PREFIX)
+    except ObjectStoreError as e:
+        log.warning("retention: could not list %s: %s", EPISODE_PREFIX, e)
+        return 0
+    deleted = 0
+    for key in all_keys:
+        if key in keep_keys:
+            continue
+        try:
+            store.delete(key)
+            deleted += 1
+        except ObjectStoreError as e:
+            log.warning("retention: could not delete %s: %s", key, e)
+    return deleted
+
+
 def update_feed(d: date | None = None, *, store: ObjectStore | None = None) -> Path:
     """Stage 9.3: download prior feed.xml, append today's item, re-upload.
 
@@ -214,7 +260,7 @@ def update_feed(d: date | None = None, *, store: ObjectStore | None = None) -> P
     entries.append(today_entry)
 
     entries.sort(key=lambda e: e["pubDate"], reverse=True)
-    entries = entries[:MAX_ITEMS]
+    entries = entries[:RETENTION_COUNT]
 
     show_cfg = load_show()
     xml_bytes = _build_feed(show_cfg, entries)
@@ -228,4 +274,13 @@ def update_feed(d: date | None = None, *, store: ObjectStore | None = None) -> P
     out_path.write_bytes(xml_bytes)
     log.info("rss: wrote %s (%d entries) and uploaded to %s/%s",
              out_path.name, len(entries), store.name, FEED_KEY)
+
+    # Prune R2 to match the feed: anything under episodes/ that isn't
+    # referenced by one of the surviving entries gets deleted, so listeners'
+    # apps never hit a 404.
+    keep_keys = _kept_episode_keys(entries)
+    deleted = _prune_orphan_episodes(store, keep_keys)
+    if deleted:
+        log.info("retention: pruned %d orphan episode(s) from %s",
+                 deleted, store.name)
     return out_path

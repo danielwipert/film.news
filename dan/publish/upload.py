@@ -32,7 +32,7 @@ class UploadError(RuntimeError):
     """Stage 9.2 hard failure — missing episode, upload error, or HEAD failed."""
 
 
-def _episode_key(d: date) -> str:
+def episode_key(d: date) -> str:
     """Build the spec §12.2 storage key for date `d`."""
     return f"episodes/{d:%Y}/{d:%m}/dan-film-{d.isoformat()}.mp3"
 
@@ -75,7 +75,7 @@ def upload(d: date | None = None, *, store: ObjectStore | None = None) -> Path:
 
     data = episode_path.read_bytes()
     size = len(data)
-    key = _episode_key(d)
+    key = episode_key(d)
     log.info("upload: %s (%d bytes) -> %s/%s", episode_path.name, size, store.name, key)
 
     try:

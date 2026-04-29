@@ -13,16 +13,16 @@ from dan.publish.store import ObjectStoreError
 from dan.publish.upload import UploadError
 
 
-# ---------- _episode_key ----------
+# ---------- episode_key ----------
 
 def test_episode_key_zero_pads_month():
-    assert upload._episode_key(date(2026, 4, 27)) == (
+    assert upload.episode_key(date(2026, 4, 27)) == (
         "episodes/2026/04/dan-film-2026-04-27.mp3"
     )
 
 
 def test_episode_key_double_digit_month():
-    assert upload._episode_key(date(2026, 12, 1)) == (
+    assert upload.episode_key(date(2026, 12, 1)) == (
         "episodes/2026/12/dan-film-2026-12-01.mp3"
     )
 

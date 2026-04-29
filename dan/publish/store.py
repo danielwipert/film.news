@@ -32,6 +32,8 @@ class ObjectStore(Protocol):
     def get(self, key: str) -> bytes | None: ...
     def url_for(self, key: str) -> str: ...
     def exists(self, key: str) -> bool: ...
+    def list_prefix(self, prefix: str) -> list[str]: ...
+    def delete(self, key: str) -> None: ...
 
 
 class R2ObjectStore:
@@ -129,3 +131,20 @@ class R2ObjectStore:
             raise ObjectStoreError(f"head {key!r} failed: {e}") from e
         except BotoCoreError as e:
             raise ObjectStoreError(f"head {key!r} failed: {e}") from e
+
+    def list_prefix(self, prefix: str) -> list[str]:
+        """Return object keys under `prefix`. Single list_objects_v2 call —
+        sufficient for our scale (retention keeps ≤7 episodes; bucket-wide
+        is far below the 1000-key page size)."""
+        try:
+            resp = self._client.list_objects_v2(Bucket=self._bucket, Prefix=prefix)
+        except (ClientError, BotoCoreError) as e:
+            raise ObjectStoreError(f"list_prefix {prefix!r} failed: {e}") from e
+        return [obj["Key"] for obj in (resp.get("Contents") or []) if obj.get("Key")]
+
+    def delete(self, key: str) -> None:
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=key)
+        except (ClientError, BotoCoreError) as e:
+            raise ObjectStoreError(f"delete {key!r} failed: {e}") from e
+        log.info("store: delete %s/%s", self._bucket, key)
