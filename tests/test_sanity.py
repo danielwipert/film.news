@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import date
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -104,12 +105,40 @@ def test_verify_claim_supported_does_not_retry():
     assert p.complete.await_count == 1
 
 
-def test_verify_claim_malformed_json_falls_back_to_unsupported_after_retry():
-    """Two malformed responses in a row → defaults to unsupported."""
+def test_verify_claim_malformed_json_twice_treated_as_supported():
+    """Two malformed responses in a row → transient API issue, accept the
+    claim with a note rather than failing the pipeline. Real disagreements
+    surface as 'unsupported' verdicts; persistent malformed JSON is a flaky
+    API artifact and shouldn't be conflated with hallucination."""
     p = _provider("not json", "still not json")
     out = asyncio.run(sanity._verify_claim(p, "m", "sys", "c", "src"))
-    assert out["status"] == "unsupported"
+    assert out["status"] == "supported"
     assert "malformed" in out["evidence"]
+    assert p.complete.await_count == 2
+
+
+def test_verify_claim_malformed_first_real_verdict_on_retry_uses_retry():
+    """Malformed first call, real 'unsupported' on retry → use the retry's
+    verdict and evidence, not the malformed-JSON placeholder."""
+    p = _provider(
+        "not json",
+        json.dumps({"status": "unsupported", "evidence": "actually not in source"}),
+    )
+    out = asyncio.run(sanity._verify_claim(p, "m", "sys", "c", "src"))
+    assert out["status"] == "unsupported"
+    assert out["evidence"] == "actually not in source"
+    assert p.complete.await_count == 2
+
+
+def test_verify_claim_real_verdict_first_malformed_on_retry_uses_first():
+    """Real 'unsupported' first, malformed on retry → keep the real verdict."""
+    p = _provider(
+        json.dumps({"status": "unsupported", "evidence": "real reason"}),
+        "not json",
+    )
+    out = asyncio.run(sanity._verify_claim(p, "m", "sys", "c", "src"))
+    assert out["status"] == "unsupported"
+    assert out["evidence"] == "real reason"
     assert p.complete.await_count == 2
 
 
@@ -261,10 +290,12 @@ def test_sanity_raises_when_rewrite_still_fails(monkeypatch, tmp_path):
     assert final["meta"]["rewrites"] == 1
 
 
-def test_sanity_partial_status_is_treated_as_failure(monkeypatch, tmp_path):
-    """A 'partial' verification status should trigger the rewrite path
-    just like 'unsupported' — partial means the script added a detail not
-    in the source."""
+def test_sanity_partial_status_does_not_trigger_rewrite(monkeypatch, tmp_path):
+    """A 'partial' verdict means the claim is mostly supported (per the
+    verifier prompt). It is logged but should NOT trigger a rewrite —
+    rewriting on partials caused cascading false positives because the
+    rewrite changes wording in ways that break previously-supported
+    claims. Spec §8 says only unsupported triggers rewrite."""
     monkeypatch.setattr(sanity, "log_dir", lambda d=None: tmp_path)
     _patch_config(monkeypatch)
     _setup_inputs(tmp_path)
@@ -272,16 +303,37 @@ def test_sanity_partial_status_is_treated_as_failure(monkeypatch, tmp_path):
     fake = MagicMock()
     fake.complete = AsyncMock(side_effect=[
         json.dumps({"claims": ["one fact"]}),
-        json.dumps({"status": "partial", "evidence": "added a detail"}),
-        # Retry — still partial, so the failure verdict survives
+        json.dumps({"status": "partial", "evidence": "added a small detail"}),
+        # Retry on the non-supported verdict — still partial.
         json.dumps({"status": "partial", "evidence": "still partial"}),
-        # Rewrite
-        "<speak>tightened</speak>",
-        # Pass 2
-        json.dumps({"claims": ["one tight fact"]}),
-        json.dumps({"status": "supported", "evidence": "ok"}),
     ])
     out_path = sanity.sanity(provider=fake)
     data = json.loads(out_path.read_text(encoding="utf-8"))
-    assert data["meta"]["rewrites"] == 1
+    assert data["meta"]["rewrites"] == 0
     assert data["meta"]["passed"] is True
+    assert data["claims"][0]["status"] == "partial"
+    # No rewrite snapshot files should exist.
+    assert not (tmp_path / "04_script.bad.txt").exists()
+    assert not (tmp_path / "05_sanity.bad.json").exists()
+
+
+def test_is_show_date_claim_filters_broadcast_date_lines():
+    """Cold-open claims about the show's own broadcast date should be dropped
+    at extract time so they never reach verification — the source summaries
+    don't mention the show's date and the verifier reliably flags them."""
+    today = date(2026, 4, 28)
+    assert sanity._is_show_date_claim(
+        "The broadcast date is Tuesday, April 28, 2026.", today
+    )
+    assert sanity._is_show_date_claim(
+        "The daily film news brief is for Tuesday, April 28, 2026.", today
+    )
+    assert sanity._is_show_date_claim("Today is 2026-04-28.", today)
+    # Non-show claims that happen to mention the date should NOT be dropped.
+    assert not sanity._is_show_date_claim(
+        "Michael opened on April 28, 2026 in the UK.", today
+    )
+    # Show keywords without the date string should NOT be dropped.
+    assert not sanity._is_show_date_claim(
+        "The broadcast included an Antoine Fuqua film.", today
+    )

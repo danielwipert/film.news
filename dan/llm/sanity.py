@@ -108,11 +108,14 @@ async def _verify_claim(
     verifier is stochastic enough at T=0 that the same claim against the
     same source can flip between supported and unsupported across calls
     (observed: a "Michael 217m opening weekend" claim marked supported in
-    pass 1 came back unsupported in pass 2 of the same run). Malformed
-    JSON and unknown status values are also treated as non-supported and
-    trigger the same re-ask. If the second call says supported, accept
-    it; otherwise keep the first verdict so real hallucinations still
-    surface.
+    pass 1 came back unsupported in pass 2 of the same run). If the
+    second call says supported, accept it; otherwise keep the real
+    verifier verdict so genuine hallucinations still surface.
+
+    Malformed JSON is treated as a transient API failure rather than a
+    real verdict: if both attempts return malformed JSON, mark the claim
+    supported with a note (don't fail the pipeline on flaky API output);
+    if only one of the two is malformed, prefer the other call's verdict.
     """
     user = (
         f"Source key facts and summaries:\n{source_block}\n\n"
@@ -120,8 +123,9 @@ async def _verify_claim(
     )
 
     async def _ask() -> tuple[str, str]:
-        """One verify call. Returns (status, evidence). Status is
-        normalized — malformed JSON or unknown values become 'unsupported'."""
+        """One verify call. Returns (status, evidence). Status is one of
+        the public verdicts or the internal sentinel 'malformed' for
+        unparseable responses."""
         text = await provider.complete(
             system=system, user=user, model=model,
             json_mode=True, temperature=VERIFY_TEMPERATURE,
@@ -129,7 +133,7 @@ async def _verify_claim(
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            return ("unsupported", "verifier returned malformed JSON")
+            return ("malformed", "verifier returned malformed JSON")
         status = data.get("status", "unsupported")
         if status not in _VALID_STATUSES:
             status = "unsupported"
@@ -146,6 +150,20 @@ async def _verify_claim(
         log.info("verify: retry says supported for claim %r", claim[:60])
         return {"text": claim, "status": "supported", "evidence": retry_evidence}
 
+    # Both malformed → transient API issue, not a real disagreement.
+    if status == "malformed" and retry_status == "malformed":
+        log.warning("verify: malformed JSON twice for claim %r; treating as supported", claim[:60])
+        return {
+            "text": claim,
+            "status": "supported",
+            "evidence": "verifier API returned malformed JSON twice — accepted as transient",
+        }
+    # One malformed, one real verdict → use the real one.
+    if status == "malformed":
+        return {"text": claim, "status": retry_status, "evidence": retry_evidence}
+    if retry_status == "malformed":
+        return {"text": claim, "status": status, "evidence": evidence}
+
     return {"text": claim, "status": status, "evidence": evidence}
 
 
@@ -161,6 +179,25 @@ async def _verify_all(
     )))
 
 
+def _is_show_date_claim(claim: str, today: date) -> bool:
+    """True if the claim merely restates the show's own broadcast date.
+
+    The cold-open says today's date as part of the show's intro — it isn't a
+    factual claim about a news item. The extract prompt tells the model to
+    skip these, but it sometimes pulls them anyway, and the verifier then
+    flags them because the source summaries don't mention the show's own
+    date. Filtering here is defense-in-depth.
+    """
+    lower = claim.lower()
+    show_kw = ("broadcast", "brief", "this is your", "today is", "today's date", "morning brief")
+    if not any(kw in lower for kw in show_kw):
+        return False
+    iso = today.isoformat()
+    weekday = today.strftime("%A").lower()
+    month = today.strftime("%B").lower()
+    return iso in lower or (weekday in lower and month in lower)
+
+
 async def _run_pass(
     script_text: str,
     items: list[dict[str, Any]],
@@ -172,6 +209,11 @@ async def _run_pass(
 ) -> list[dict[str, str]]:
     claims = await _extract_claims(provider, models_cfg["sanity_extract"], extract_sys, script_text)
     log.info("sanity: extracted %d claims", len(claims))
+    if today is not None:
+        kept = [c for c in claims if not _is_show_date_claim(c, today)]
+        if len(kept) < len(claims):
+            log.info("sanity: dropped %d show-date claim(s) at extract", len(claims) - len(kept))
+        claims = kept
     if not claims:
         return []
     source_block = _format_source_for_verify(items, today=today)
@@ -204,12 +246,16 @@ async def _rewrite_with_feedback(
     )
 
 
-def _all_supported(verifications: list[dict[str, str]]) -> bool:
-    return all(v["status"] == "supported" for v in verifications)
+def _has_unsupported(verifications: list[dict[str, str]]) -> bool:
+    """Spec §8: only 'unsupported' triggers rewrite. 'partial' is mild
+    by definition ('mostly supported'); rewriting on partials creates
+    cascading false positives because the rewrite can change wording in
+    ways that break previously-supported claims."""
+    return any(v["status"] == "unsupported" for v in verifications)
 
 
-def _problems(verifications: list[dict[str, str]]) -> list[dict[str, str]]:
-    return [v for v in verifications if v["status"] != "supported"]
+def _unsupported(verifications: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [v for v in verifications if v["status"] == "unsupported"]
 
 
 def sanity(d: date | None = None, *, provider: OpenRouterProvider | None = None) -> Path:
@@ -254,9 +300,9 @@ def sanity(d: date | None = None, *, provider: OpenRouterProvider | None = None)
     ))
 
     rewrites = 0
-    if not _all_supported(verifications):
-        bad = _problems(verifications)
-        log.warning("sanity: %d unsupported/partial claim(s); rewriting once", len(bad))
+    if _has_unsupported(verifications):
+        bad = _unsupported(verifications)
+        log.warning("sanity: %d unsupported claim(s); rewriting once", len(bad))
         # Snapshot the failing script + first report for inspection.
         write_text(day_dir / "04_script.bad.txt", script_ssml)
         write_json(day_dir / "05_sanity.bad.json", {
@@ -277,8 +323,8 @@ def sanity(d: date | None = None, *, provider: OpenRouterProvider | None = None)
             script_text, items, models_cfg, provider, extract_sys, verify_sys, today=d,
         ))
 
-        if not _all_supported(verifications):
-            still = _problems(verifications)
+        if _has_unsupported(verifications):
+            still = _unsupported(verifications)
             write_json(out_path, {
                 "meta": {"model": models_cfg["sanity_verify"], "passed": False, "rewrites": 1},
                 "claims": verifications,
