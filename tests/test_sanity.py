@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from dan.llm import sanity
-from dan.llm.sanity import SanityError
 
 
 def _provider(*completions):
@@ -261,33 +260,74 @@ def test_sanity_rewrites_then_passes_on_second_attempt(monkeypatch, tmp_path):
     assert (tmp_path / "04_script.txt").read_text(encoding="utf-8") == revised_script
 
 
-def test_sanity_raises_when_rewrite_still_fails(monkeypatch, tmp_path):
+def test_sanity_does_not_raise_when_rewrite_still_fails(monkeypatch, tmp_path):
+    """Sanity is advisory: even when unsupported claims survive the rewrite,
+    the pipeline must continue. The final report records passed=false; the
+    script is reverted to the original because the rewrite did not strictly
+    reduce the unsupported count."""
     monkeypatch.setattr(sanity, "log_dir", lambda d=None: tmp_path)
     _patch_config(monkeypatch)
-    _setup_inputs(tmp_path)
+    original_script = "<speak>original with bad fact</speak>"
+    _setup_inputs(tmp_path, script=original_script)
 
     fake = MagicMock()
     fake.complete = AsyncMock(side_effect=[
-        # Pass 1
+        # Pass 1: extract + verify (with retry on the unsupported)
         json.dumps({"claims": ["claim 1"]}),
         json.dumps({"status": "unsupported", "evidence": "no"}),
-        # Pass 1 retry — still unsupported
         json.dumps({"status": "unsupported", "evidence": "still no"}),
         # Rewrite
         "<speak>revised but still broken</speak>",
-        # Pass 2
+        # Pass 2: extract + verify (with retry, still unsupported)
         json.dumps({"claims": ["claim 1"]}),
         json.dumps({"status": "unsupported", "evidence": "still no"}),
-        # Pass 2 retry — still unsupported
         json.dumps({"status": "unsupported", "evidence": "still no after retry"}),
     ])
 
-    with pytest.raises(SanityError, match="1 unsupported"):
-        sanity.sanity(provider=fake)
-    # Final report is written even on failure so debug info is preserved
-    final = json.loads((tmp_path / "05_sanity.json").read_text(encoding="utf-8"))
+    out_path = sanity.sanity(provider=fake)
+    final = json.loads(out_path.read_text(encoding="utf-8"))
     assert final["meta"]["passed"] is False
     assert final["meta"]["rewrites"] == 1
+    # Rewrite did not improve unsupported count → 04_script.txt reverted to original.
+    assert (tmp_path / "04_script.txt").read_text(encoding="utf-8") == original_script
+    # Bad-script + bad-report snapshots still saved for inspection.
+    assert (tmp_path / "04_script.bad.txt").exists()
+    assert (tmp_path / "05_sanity.bad.json").exists()
+
+
+def test_sanity_reverts_when_rewrite_does_not_reduce_unsupported(monkeypatch, tmp_path):
+    """If the rewrite returns a script with the same unsupported count as
+    the original (or worse), revert 04_script.txt — don't ship a script the
+    rewrite mangled. Final report uses the first-pass verifications."""
+    monkeypatch.setattr(sanity, "log_dir", lambda d=None: tmp_path)
+    _patch_config(monkeypatch)
+    original_script = "<speak>original</speak>"
+    _setup_inputs(tmp_path, script=original_script)
+
+    fake = MagicMock()
+    fake.complete = AsyncMock(side_effect=[
+        # Pass 1: 2 claims, one unsupported.
+        json.dumps({"claims": ["good", "bad"]}),
+        json.dumps({"status": "supported", "evidence": "ok"}),
+        json.dumps({"status": "unsupported", "evidence": "no"}),
+        json.dumps({"status": "unsupported", "evidence": "still no"}),
+        # Rewrite
+        "<speak>revised</speak>",
+        # Pass 2: 2 claims, one unsupported (count unchanged → revert).
+        json.dumps({"claims": ["good2", "bad2"]}),
+        json.dumps({"status": "supported", "evidence": "ok"}),
+        json.dumps({"status": "unsupported", "evidence": "different problem"}),
+        json.dumps({"status": "unsupported", "evidence": "still"}),
+    ])
+
+    out_path = sanity.sanity(provider=fake)
+    final = json.loads(out_path.read_text(encoding="utf-8"))
+    assert final["meta"]["passed"] is False
+    assert final["meta"]["rewrites"] == 1
+    assert (tmp_path / "04_script.txt").read_text(encoding="utf-8") == original_script
+    # Final report uses first-pass verifications (the "good"/"bad" claims).
+    claim_texts = [c["text"] for c in final["claims"]]
+    assert "good" in claim_texts and "bad" in claim_texts
 
 
 def test_sanity_partial_status_does_not_trigger_rewrite(monkeypatch, tmp_path):

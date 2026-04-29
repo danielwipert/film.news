@@ -1,11 +1,24 @@
-"""Stage 5 — Sanity check.
+"""Stage 5 — Sanity check (advisory).
 
-Spec §8: extract every checkable claim from 04_script.txt, then verify each
-against the key facts and summaries in 03_summaries.json. If any claim is
-unsupported, save the bad script as 04_script.bad.txt, run one rewrite via
-the Stage 4 critique prompt with the unsupported claims as context, then
-re-verify. If it still fails, raise — the workflow fails and no episode is
-published.
+Spec §8 originally mandated hard-failing the pipeline on any unsupported
+claim that survives one rewrite. In practice the verifier is a small
+LLM whose stochastic false-positives took the show off the air more often
+than the script actually contained hallucinations. Sanity is now advisory:
+
+  - Extract every checkable claim from 04_script.txt.
+  - Verify each against the key facts and summaries in 03_summaries.json
+    (with the existing retry-once / partial-skip / malformed-skip / broadcast-
+    date-filter mitigations to keep verifier noise down).
+  - If any claim is unsupported, snapshot the original as 04_script.bad.txt
+    and try one rewrite via the Stage 4 critique prompt with the unsupported
+    claims as feedback.
+  - Re-verify. If the rewrite did not strictly reduce the unsupported count,
+    revert 04_script.txt to the original — don't ship a worse script.
+  - Always write 05_sanity.json with the final verdict and return. Never
+    raise. Pipeline continues so the show goes out.
+
+Each unsupported claim that survives is logged at WARNING with full text +
+evidence so the GH Actions log alone is enough to debug a flagged run.
 """
 from __future__ import annotations
 
@@ -19,7 +32,7 @@ from typing import Any
 
 from dan import config
 from dan.io import read_json, read_text, write_json, write_text
-from dan.llm.openrouter import LLMError, OpenRouterProvider
+from dan.llm.openrouter import OpenRouterProvider
 from dan.llm.write import _strip_code_fences
 from dan.paths import ROOT, log_dir, today_utc
 
@@ -36,10 +49,6 @@ REWRITE_MAX_TOKENS = 4000
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _VALID_STATUSES = ("supported", "unsupported", "partial")
-
-
-class SanityError(RuntimeError):
-    """Stage 5 hard failure — unsupported claims persist after the one rewrite."""
 
 
 def _strip_ssml(ssml: str) -> str:
@@ -258,11 +267,26 @@ def _unsupported(verifications: list[dict[str, str]]) -> list[dict[str, str]]:
     return [v for v in verifications if v["status"] == "unsupported"]
 
 
+def _log_unsupported(verifications: list[dict[str, str]]) -> None:
+    """Surface each unsupported claim at WARNING level so the workflow log
+    contains the diagnostic without anyone needing to download the artifact.
+    """
+    for v in _unsupported(verifications):
+        text = (v.get("text") or "").strip()
+        evidence = (v.get("evidence") or "").strip()
+        log.warning("  flagged claim: %s", text[:200])
+        if evidence:
+            log.warning("    evidence: %s", evidence[:300])
+
+
 def sanity(d: date | None = None, *, provider: OpenRouterProvider | None = None) -> Path:
     """Verify 04_script.txt against 03_summaries.json. Write 05_sanity.json.
 
-    On unsupported claims: save the bad script + bad report, rewrite once via
-    the critique prompt with feedback, re-verify. If still failing, raise.
+    Advisory: never raises. On unsupported claims, snapshot the original and
+    attempt one rewrite via the critique prompt with feedback. If the rewrite
+    does not strictly reduce the unsupported count, revert 04_script.txt to
+    the original. Always write 05_sanity.json and return so the pipeline
+    continues to Stage 6.
     """
     if d is None:
         d = today_utc()
@@ -272,7 +296,8 @@ def sanity(d: date | None = None, *, provider: OpenRouterProvider | None = None)
     items = summaries.get("items") or []
 
     script_path = day_dir / "04_script.txt"
-    script_ssml = read_text(script_path)
+    original_ssml = read_text(script_path)
+    script_ssml = original_ssml
     script_text = _strip_ssml(script_ssml)
 
     out_path = day_dir / "05_sanity.json"
@@ -295,49 +320,77 @@ def sanity(d: date | None = None, *, provider: OpenRouterProvider | None = None)
         provider = OpenRouterProvider()
 
     log.info("sanity: first pass with %s", models_cfg["sanity_verify"])
-    verifications = asyncio.run(_run_pass(
+    first_pass = asyncio.run(_run_pass(
         script_text, items, models_cfg, provider, extract_sys, verify_sys, today=d,
     ))
 
     rewrites = 0
-    if _has_unsupported(verifications):
-        bad = _unsupported(verifications)
-        log.warning("sanity: %d unsupported claim(s); rewriting once", len(bad))
+    final_verifications = first_pass
+
+    if _has_unsupported(first_pass):
+        first_unsupported = _unsupported(first_pass)
+        log.warning(
+            "sanity: %d unsupported claim(s) on first pass — attempting rewrite",
+            len(first_unsupported),
+        )
+        _log_unsupported(first_pass)
         # Snapshot the failing script + first report for inspection.
-        write_text(day_dir / "04_script.bad.txt", script_ssml)
+        write_text(day_dir / "04_script.bad.txt", original_ssml)
         write_json(day_dir / "05_sanity.bad.json", {
             "meta": {"model": models_cfg["sanity_verify"], "passed": False, "rewrites": 0},
-            "claims": verifications,
+            "claims": first_pass,
         })
 
         revised = _strip_code_fences(asyncio.run(_rewrite_with_feedback(
-            script_ssml, bad, models_cfg["write_critique"], provider, critique_sys,
+            original_ssml, first_unsupported, models_cfg["write_critique"],
+            provider, critique_sys,
         )))
         write_text(script_path, revised)
-        script_ssml = revised
-        script_text = _strip_ssml(script_ssml)
         rewrites = 1
 
         log.info("sanity: re-verifying after rewrite")
-        verifications = asyncio.run(_run_pass(
-            script_text, items, models_cfg, provider, extract_sys, verify_sys, today=d,
+        second_pass = asyncio.run(_run_pass(
+            _strip_ssml(revised), items, models_cfg, provider, extract_sys, verify_sys, today=d,
         ))
+        second_unsupported = _unsupported(second_pass)
 
-        if _has_unsupported(verifications):
-            still = _unsupported(verifications)
-            write_json(out_path, {
-                "meta": {"model": models_cfg["sanity_verify"], "passed": False, "rewrites": 1},
-                "claims": verifications,
-            })
-            raise SanityError(f"{len(still)} unsupported claim(s) remain after rewrite")
+        if len(second_unsupported) < len(first_unsupported):
+            log.info(
+                "sanity: rewrite reduced unsupported count %d → %d; keeping rewrite",
+                len(first_unsupported), len(second_unsupported),
+            )
+            final_verifications = second_pass
+        else:
+            # Rewrite did not help — restore the original script. Don't ship
+            # a script the rewrite mangled. Report on the first-pass results.
+            log.warning(
+                "sanity: rewrite produced %d unsupported claim(s) (was %d); "
+                "reverting 04_script.txt to original",
+                len(second_unsupported), len(first_unsupported),
+            )
+            write_text(script_path, original_ssml)
+            final_verifications = first_pass
+
+    final_unsupported = _unsupported(final_verifications)
+    passed = not final_unsupported
+
+    if not passed:
+        log.warning(
+            "sanity: %d unsupported claim(s) remain — advisory mode, pipeline continuing",
+            len(final_unsupported),
+        )
+        _log_unsupported(final_verifications)
 
     write_json(out_path, {
         "meta": {
             "model": models_cfg["sanity_verify"],
-            "passed": True,
+            "passed": passed,
             "rewrites": rewrites,
         },
-        "claims": verifications,
+        "claims": final_verifications,
     })
-    log.info("sanity: passed (rewrites=%d, claims=%d)", rewrites, len(verifications))
+    log.info(
+        "sanity: complete (passed=%s, rewrites=%d, claims=%d, unsupported=%d)",
+        passed, rewrites, len(final_verifications), len(final_unsupported),
+    )
     return out_path
