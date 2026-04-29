@@ -91,11 +91,22 @@ def test_verify_claim_unknown_status_falls_back_to_unsupported():
     assert out["status"] == "unsupported"
 
 
-def test_verify_claim_malformed_json_falls_back_to_unsupported():
-    p = _provider("not json")
+def test_verify_claim_malformed_json_falls_back_to_unsupported_after_retry():
+    """Two malformed responses in a row → defaults to unsupported."""
+    p = _provider("not json", "still not json")
     out = asyncio.run(sanity._verify_claim(p, "m", "sys", "c", "src"))
     assert out["status"] == "unsupported"
     assert "malformed" in out["evidence"]
+    assert p.complete.await_count == 2
+
+
+def test_verify_claim_retries_on_malformed_json():
+    """One malformed response then a valid one → uses the valid one."""
+    p = _provider("not json", json.dumps({"status": "supported", "evidence": "ok"}))
+    out = asyncio.run(sanity._verify_claim(p, "m", "sys", "c", "src"))
+    assert out["status"] == "supported"
+    assert out["evidence"] == "ok"
+    assert p.complete.await_count == 2
 
 
 # ---------- sanity() pipeline entry ----------

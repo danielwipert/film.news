@@ -22,6 +22,13 @@ Rules:
     "In other film news,", "From the festival circuit").
   - Skip non-checkable opinion or color ("the film looks promising",
     "an unsettling exploration", "fans were excited").
+  - Skip the cold open and sign-off — sentences that describe the show's
+    own format rather than the news. These include the host's greeting
+    ("Good morning"), the broadcast-date line ("This is your daily film
+    news brief for [date]", "Here's what's playing today"), and the
+    closing line ("That's your film news for today", "We'll see you
+    tomorrow"). The brief's own publication date and show schedule are
+    not source claims to verify.
   - Include named people, films, studios, awards, dates, dollar amounts,
     durations (e.g. "fourteen-month shoot"), quotes, and explicit
     relationships ("X is the director of Y").

@@ -102,20 +102,33 @@ async def _verify_claim(
     claim: str,
     source_block: str,
 ) -> dict[str, str]:
-    """Call B (per claim) — return {text, status, evidence}."""
+    """Call B (per claim) — return {text, status, evidence}.
+
+    Retries once if the verifier returns malformed JSON. A single bad
+    response otherwise becomes a false-positive "unsupported" verdict and
+    fails the whole pipeline due to LLM stochasticity, not a real issue
+    with the claim.
+    """
     user = (
         f"Source key facts and summaries:\n{source_block}\n\n"
         f"Claim to verify:\n{claim}"
     )
-    text = await provider.complete(
-        system=system, user=user, model=model,
-        json_mode=True, temperature=VERIFY_TEMPERATURE,
-    )
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        log.warning("verify: malformed JSON for claim %r — defaulting unsupported", claim[:60])
-        return {"text": claim, "status": "unsupported", "evidence": "verifier returned malformed JSON"}
+    data: dict[str, Any] | None = None
+    for attempt in (1, 2):
+        text = await provider.complete(
+            system=system, user=user, model=model,
+            json_mode=True, temperature=VERIFY_TEMPERATURE,
+        )
+        try:
+            data = json.loads(text)
+            break
+        except json.JSONDecodeError:
+            if attempt == 1:
+                log.warning("verify: malformed JSON for claim %r — retrying", claim[:60])
+                continue
+            log.warning("verify: malformed JSON after retry for claim %r — defaulting unsupported", claim[:60])
+            return {"text": claim, "status": "unsupported", "evidence": "verifier returned malformed JSON after retry"}
+    assert data is not None  # loop either sets data or returns
     status = data.get("status", "unsupported")
     if status not in _VALID_STATUSES:
         log.warning("verify: unknown status %r for claim %r — defaulting unsupported", status, claim[:60])
@@ -249,7 +262,7 @@ def sanity(d: date | None = None, *, provider: OpenRouterProvider | None = None)
 
         log.info("sanity: re-verifying after rewrite")
         verifications = asyncio.run(_run_pass(
-            script_text, items, models_cfg, provider, extract_sys, verify_sys,
+            script_text, items, models_cfg, provider, extract_sys, verify_sys, today=d,
         ))
 
         if not _all_supported(verifications):
