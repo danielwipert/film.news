@@ -37,6 +37,9 @@ DESCRIBE_MAX_TOKENS = 200
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 _TERMINATOR_RE = re.compile(r"[.!?]")
+# Split on sentence terminators, keeping the terminator with the preceding
+# sentence so we can rejoin without losing punctuation.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 # Strip a wrapping pair of straight or curly quotes if the model returns
 # the description as a single quoted string.
 _OUTER_QUOTES_RE = re.compile(r'^[\s"“”\']+|[\s"“”\']+$')
@@ -44,6 +47,25 @@ _OUTER_QUOTES_RE = re.compile(r'^[\s"“”\']+|[\s"“”\']+$')
 
 class DescribeError(RuntimeError):
     """Stage 9.1 hard failure — both attempts produced an unusable description."""
+
+
+def _truncate_to_fit(text: str, limit: int) -> str:
+    """Drop trailing sentences until the text fits under `limit` chars.
+
+    The describe model (flash-lite) sometimes overshoots 300 chars by a small
+    margin even on retry. Rather than fail the whole pipeline on metadata,
+    cut whole sentences from the end. If even the first sentence is too long,
+    hard-cut at a word boundary and append an ellipsis.
+    """
+    sentences = _SENTENCE_SPLIT_RE.split(text.strip())
+    while sentences:
+        candidate = " ".join(sentences).strip()
+        if len(candidate) <= limit:
+            return candidate
+        sentences.pop()
+    # First sentence alone exceeds the limit — hard-cut at a word boundary.
+    head = text[: limit - 1].rsplit(" ", 1)[0].rstrip(",;:- ")
+    return head + "…"
 
 
 def _strip_ssml(ssml: str) -> str:
@@ -80,6 +102,7 @@ async def _describe_async(
     """Run the LLM call with one retry on validation/LLM error."""
     user = f"Episode script:\n{script_text}\n\nWrite the description."
     last_err: str | None = None
+    last_overlong: str | None = None  # candidate that only failed the length check
 
     for attempt in (1, 2):
         system = base_system
@@ -101,9 +124,23 @@ async def _describe_async(
         except ValueError as e:
             last_err = str(e)
             log.warning("describe validation failed (attempt %d/2): %s", attempt, e)
+            # Stash the cleaned-but-overlong candidate so we can salvage it
+            # if the second attempt also fails.
+            cleaned = _OUTER_QUOTES_RE.sub("", text or "").strip()
+            if cleaned and len(cleaned) > DESCRIPTION_MAX_CHARS and _TERMINATOR_RE.search(cleaned):
+                last_overlong = cleaned
         except LLMError as e:
             last_err = str(e)
             log.warning("describe LLM error (attempt %d/2): %s", attempt, e)
+
+    if last_overlong is not None:
+        salvaged = _truncate_to_fit(last_overlong, DESCRIPTION_MAX_CHARS)
+        if len(salvaged) >= DESCRIPTION_MIN_CHARS and _TERMINATOR_RE.search(salvaged):
+            log.warning(
+                "describe: both attempts overran %d chars; truncated to %d chars",
+                DESCRIPTION_MAX_CHARS, len(salvaged),
+            )
+            return salvaged
 
     raise DescribeError(f"describe failed after retry: {last_err}")
 

@@ -111,6 +111,36 @@ def test_describe_async_raises_after_two_validation_failures():
         asyncio.run(describe._describe_async(p, "model", "system", "script"))
 
 
+def test_describe_async_salvages_overlong_after_two_attempts():
+    """Both attempts overrun the char limit -> truncate to last fitting sentence."""
+    import asyncio
+    # Two sentences, the second pushes us over. Truncation should drop the second.
+    s1 = "A" * 200 + "."  # 201 chars on its own — fits under 300
+    s2 = " " + "B" * 90 + "."  # adds 92 more -> 293 total, still fits
+    s3 = " " + "C" * 90 + "."  # adds another 92 -> 385 total, too long
+    overlong_1 = s1 + s2 + s3  # 385 chars
+    overlong_2 = s1 + s2 + s3 + " " + "D" * 50 + "."  # also too long
+    p = _provider(overlong_1, overlong_2)
+    out = asyncio.run(describe._describe_async(p, "model", "system", "script"))
+    # Should have truncated overlong_2 down to s1+s2 (~293 chars), under 300.
+    assert len(out) <= describe.DESCRIPTION_MAX_CHARS
+    assert len(out) >= describe.DESCRIPTION_MIN_CHARS
+    assert out.endswith(".")
+
+
+def test_truncate_to_fit_drops_trailing_sentences():
+    text = "First sentence here. Second sentence here. Third sentence here."
+    out = describe._truncate_to_fit(text, limit=45)
+    assert out == "First sentence here. Second sentence here."
+
+
+def test_truncate_to_fit_hard_cuts_when_first_sentence_too_long():
+    text = "This single sentence is far longer than the tiny limit we set."
+    out = describe._truncate_to_fit(text, limit=20)
+    assert len(out) <= 20
+    assert out.endswith("…")
+
+
 def test_describe_async_second_prompt_includes_failure_reason():
     import asyncio
     good = "Today's brief covers two festival stories and a major casting decision. Full details inside."
