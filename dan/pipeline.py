@@ -39,8 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--days-back",
         type=int,
-        default=1,
-        help="Fetch window in days (default 1 per spec; raise for testing on quiet days).",
+        default=3,
+        help="Fetch window in days (default 3; rank dedups against prior episodes).",
     )
     args = parser.parse_args(argv)
 

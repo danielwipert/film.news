@@ -118,12 +118,14 @@ def _passes_filters(a: dict[str, Any]) -> bool:
     return True
 
 
-def fetch(d: date | None = None, *, days_back: int = 1) -> Path:
+def fetch(d: date | None = None, *, days_back: int = 3) -> Path:
     """Fetch articles published since (d - days_back) and write 01_raw_articles.json.
 
-    Production uses days_back=1 per spec §4.2. Higher values are intended for
-    local testing on quiet days when one day of Guardian film coverage is too
-    thin to exercise the rank/variety logic.
+    Window matches DEDUP_LOOKBACK_DAYS in rank.py: pulling 3 days lets quiet
+    days surface articles that didn't make prior episodes' cuts, while the
+    rank stage's cross-episode dedup strips anything already aired and the
+    freshness score (5 = <24h, 1 = older) keeps yesterday's news from
+    displacing today's on a busy day.
 
     Returns the output path. Raises FetchError on auth/API failure.
     """
