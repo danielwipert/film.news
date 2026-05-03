@@ -111,6 +111,10 @@ def test_write_async_runs_draft_then_critique():
 
     assert critique_call.kwargs["system"] == "CRITIQUE_SYS"
     assert draft in critique_call.kwargs["user"]
+    # Summaries must be in the critique message so the prompt's
+    # "expand using texture from the summaries" instruction is actionable.
+    assert "Story 0 headline" in critique_call.kwargs["user"]
+    assert "fact0-1" in critique_call.kwargs["user"]
     assert critique_call.kwargs["temperature"] == write_stage.CRITIQUE_TEMPERATURE
 
 

@@ -108,11 +108,12 @@ async def _write_async(
     critique_system: str,
 ) -> str:
     """Run draft -> critique. Returns the final SSML string."""
+    summaries_block = _summaries_for_prompt(items)
     draft_user = (
         f"Today's date: {today_str}\n"
         f"Voice name: {voice_name}\n\n"
         f"Stories (ranked, highest score first):\n"
-        f"{_summaries_for_prompt(items)}\n\n"
+        f"{summaries_block}\n\n"
         f"Write the full SSML script now."
     )
     log.info("write: draft pass with %s (%d stories)", models_cfg["write_draft"], len(items))
@@ -125,7 +126,16 @@ async def _write_async(
     ))
     log.info("write: draft is %d words", _word_count(draft))
 
-    critique_user = f"Draft to revise:\n\n{draft}\n\nReturn the revised SSML."
+    # The critique system prompt instructs the model to "expand using texture
+    # from the summaries" if the draft is short — that instruction is only
+    # actionable if the summaries are in the message. Without them, the
+    # critique can only rephrase what's already in the draft.
+    critique_user = (
+        "Source summaries the draft was built from (for fact-checking and "
+        "for restoring texture if the draft is short):\n\n"
+        f"{summaries_block}\n\n"
+        f"Draft to revise:\n\n{draft}\n\nReturn the revised SSML."
+    )
     log.info("write: critique pass with %s", models_cfg["write_critique"])
     final = _strip_code_fences(await provider.complete(
         system=critique_system,
